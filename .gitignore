@@ -1,0 +1,20 @@
+# Local connector credentials. Never commit them.
+.secrets/
+.env
+.env.*
+
+# Dex local state and generated files
+.dex-cache/
+.dexcli-data/
+definitions/
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
