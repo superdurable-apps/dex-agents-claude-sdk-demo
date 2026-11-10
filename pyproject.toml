@@ -1,0 +1,65 @@
+[project]
+name = "dex-agents-claude-sdk-demo"
+version = "0.1.0"
+description = "A durable Claude Agent SDK agent on Dex whose tools are Dex Connectors Library operations"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "dex-agents-claude-agent-sdk==0.3.0",
+    # The adapter README verifies this SDK and its bundled Claude Code CLI 2.1.316.
+    "claude-agent-sdk==0.2.176",
+    "dex-agents==0.3.0",
+    "dex-python-sdk==1.38.0",
+    "dex-connectors-sdk==0.7.0",
+    "dex-connector-slack",
+    "dex-connector-google-gmail",
+    "dex-connector-hackernews",
+    "dex-connector-google-youtube",
+    "dex-connector-reddit",
+    "dex-connector-spotify",
+]
+
+[project.scripts]
+connectors-agent = "claude_connectors_demo.cli:main"
+connectors-agent-worker = "claude_connectors_demo.worker:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3,<9",
+    "pytest-asyncio>=0.26,<2",
+    "ruff>=0.8,<0.9",
+]
+
+[tool.uv]
+# The connector packages pin different exact dex-connectors-sdk versions
+# (hackernews 0.1.0, gmail 0.6.0, the others 0.7.0); one environment needs one.
+override-dependencies = ["dex-connectors-sdk==0.7.0"]
+
+[tool.uv.sources]
+dex-connector-slack = { git = "https://github.com/superdurable/dex-connectors-library", rev = "00a29c8f2cf1c2948a548b4402c24a3bc592692d", subdirectory = "connectors/slack/python" }
+dex-connector-google-gmail = { git = "https://github.com/superdurable/dex-connectors-library", rev = "00a29c8f2cf1c2948a548b4402c24a3bc592692d", subdirectory = "connectors/google/gmail/python" }
+dex-connector-hackernews = { git = "https://github.com/superdurable/dex-connectors-library", rev = "00a29c8f2cf1c2948a548b4402c24a3bc592692d", subdirectory = "connectors/hackernews/python" }
+dex-connector-google-youtube = { git = "https://github.com/superdurable/dex-connectors-library", rev = "00a29c8f2cf1c2948a548b4402c24a3bc592692d", subdirectory = "connectors/google/youtube/python" }
+dex-connector-reddit = { git = "https://github.com/superdurable/dex-connectors-library", rev = "00a29c8f2cf1c2948a548b4402c24a3bc592692d", subdirectory = "connectors/reddit/python" }
+dex-connector-spotify = { git = "https://github.com/superdurable/dex-connectors-library", rev = "00a29c8f2cf1c2948a548b4402c24a3bc592692d", subdirectory = "connectors/spotify/python" }
+
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/claude_connectors_demo"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "ASYNC", "RUF"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
