@@ -8,10 +8,13 @@ operation, plus the ``ToolPolicy`` that tells the Dex agent session where the
 call runs:
 
 * A Query is ``READ``. It runs inside the turn through ``run_query``.
-* A Mutation is ``IDEMPOTENT_WRITE`` and requires approval. It runs in its own
-  session tool Step through ``run_mutation``. Its connector ``CallID`` is
-  derived from the session's idempotency key, so every Dex retry of the Step
-  reuses the same connector idempotency key.
+* A Mutation requires approval and runs in its own session tool Step through
+  ``run_mutation``. It runs once (``NON_IDEMPOTENT_WRITE``) unless the
+  manifest's agent review declares ``retry: safe``; only then is it
+  ``IDEMPOTENT_WRITE`` and Dex may retry the Step. Connectors that may resend a
+  write on retry, such as a send confirmed by a lagging search, declare no such
+  review. Its connector ``CallID`` is derived from the session's idempotency
+  key, so a retried Step reuses the same connector idempotency key.
 
 Results map to what the model reads:
 
@@ -23,9 +26,11 @@ Results map to what the model reads:
   result that says plainly that the outcome is unknown and must not be blindly
   retried. A Mutation ``defect`` is always unknown, whatever the manifest says,
   because ``run_mutation`` also selects it after the operation ran.
-* A connector ``RetryError`` in a tool Step propagates, so Dex retries the Step
-  with the same ``CallID``. An inline read cannot fail its Step, so it retries
-  in place a few times and then reports a temporary failure.
+* A connector ``RetryError`` in a tool Step propagates and fails the attempt.
+  A single-attempt write then ends as ``outcome_unknown`` and is never sent
+  again; a retry-safe write is retried with the same ``CallID``. An inline read
+  cannot fail its Step, so it retries in place a few times and then reports a
+  temporary failure.
 """
 
 from __future__ import annotations
@@ -82,6 +87,7 @@ class OperationAgentReview:
 
     is_exposed: bool
     is_approval_recommended: bool
+    is_retry_safe: bool
     description: str
     branch_classes: Mapping[str, str]
 
@@ -134,12 +140,15 @@ class ConnectorBinding:
             It holds ``dex-connector.json`` and the operation input types.
         connection: The connector's ``Connection``, real or a mock.
         enabled_operation_ids: Manifest ``operationId`` values to offer, in order.
+        manifest: The operations to offer. ``None`` reads the package's
+            ``dex-connector.json``.
     """
 
     tool_prefix: str
     package: str
     connection: object
     enabled_operation_ids: Sequence[str]
+    manifest: ConnectorManifest | None = None
 
 
 @dataclass
@@ -159,7 +168,7 @@ def build_connector_toolset(bindings: Sequence[ConnectorBinding]) -> ConnectorTo
     """
     toolset = ConnectorToolset()
     for binding in bindings:
-        manifest = load_connector_manifest(binding.package)
+        manifest = binding.manifest or load_connector_manifest(binding.package)
         package_module = importlib.import_module(binding.package)
         for operation_id in binding.enabled_operation_ids:
             operation_manifest = manifest.operations.get(operation_id)
@@ -250,9 +259,15 @@ class ConnectorOperationTool:
 
     def policy(self) -> ToolPolicy:
         """Return where a call runs: a query inline, a mutation in a Step after approval."""
-        if self._manifest.kind == "mutation":
-            return ToolPolicy(ToolEffect.IDEMPOTENT_WRITE, requires_approval=True)
         review = self._manifest.agent_review
+        if self._manifest.kind == "mutation":
+            # Only an author-reviewed retry-safe write may run more than once.
+            effect = (
+                ToolEffect.IDEMPOTENT_WRITE
+                if review is not None and review.is_retry_safe
+                else ToolEffect.NON_IDEMPOTENT_WRITE
+            )
+            return ToolPolicy(effect, requires_approval=True)
         if review is not None and review.is_approval_recommended:
             return ToolPolicy(ToolEffect.READ, requires_approval=True)
         return ToolPolicy(ToolEffect.READ)
@@ -281,7 +296,7 @@ class ConnectorOperationTool:
         LOGGER.info(
             "connector mutation %s attempt %d call %s", self.tool_name, execution.attempt, call.id
         )
-        # A RetryError propagates: the session retries the Step, and the Call ID stays the same.
+        # A RetryError propagates: a single-attempt write ends as outcome_unknown.
         result = await run_mutation(self._operation, call, operation_input)
         return self._describe_result(result)
 
@@ -358,6 +373,7 @@ def _agent_review(document: Mapping[str, Any] | None) -> OperationAgentReview | 
     return OperationAgentReview(
         is_exposed=bool(document["exposed"]),
         is_approval_recommended=document.get("approval") == "recommended",
+        is_retry_safe=document.get("retry") == "safe",
         description=str(document.get("description") or ""),
         branch_classes=dict(document.get("branches") or {}),
     )
@@ -389,15 +405,22 @@ def _encode_output(branch_id: str, value: object) -> str:
     if len(text) <= MAX_TOOL_OUTPUT_CHARACTERS:
         return text
     # Stay valid JSON: a cut JSON document would mislead the model.
-    return json.dumps(
-        {
-            "branch": branch_id,
-            "truncated": True,
-            "originalLength": len(text),
-            "preview": text[:TRUNCATED_OUTPUT_PREVIEW_CHARACTERS],
-        },
-        ensure_ascii=False,
-    )
+    preview_length = TRUNCATED_OUTPUT_PREVIEW_CHARACTERS
+    while True:
+        truncated = json.dumps(
+            {
+                "branch": branch_id,
+                "truncated": True,
+                "originalLength": len(text),
+                "preview": text[:preview_length],
+            },
+            ensure_ascii=False,
+        )
+        overshoot = len(truncated) - MAX_TOOL_OUTPUT_CHARACTERS
+        if overshoot <= 0:
+            return truncated
+        # Escaping makes the preview longer than its source, so shrink by at least the excess.
+        preview_length = max(preview_length - overshoot, 0)
 
 
 def _text_result(text: str, *, is_error: bool) -> dict[str, Any]:

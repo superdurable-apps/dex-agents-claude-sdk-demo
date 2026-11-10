@@ -4,7 +4,8 @@ The Worker child and the test process both build this Flow. Scenarios are
 scripted per session ID prefix with the connector mock's ``for_flow``, because
 the mock lives in the Worker child.
 
-``slackapi_post_thread_reply`` runs the real Slack client against a scripted
+Test modules opt in to extra bindings. ``slackapi_post_thread_reply`` runs the
+real Slack client, under a test manifest that reviews it as retry-safe, against a scripted
 HTTP transport instead. Its single-dispatch fence needs the session tool Step's
 heartbeat checkpoints, which ``slackmock`` never uses. The transport answers
 the first ``chat.postMessage`` of each ``client_msg_id`` with 503 and later
@@ -19,6 +20,8 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Collection
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
@@ -44,7 +47,11 @@ from dex_connectors.slack._generated.definitions import POST_THREAD_REPLY_DEFINI
 
 from claude_connectors_demo.agent import build_agent_flow
 from claude_connectors_demo.connections import CONNECTION_NAME, ENABLED_OPERATIONS
-from claude_connectors_demo.connector_tools import ConnectorBinding
+from claude_connectors_demo.connector_tools import (
+    ConnectorBinding,
+    ConnectorManifest,
+    load_connector_manifest,
+)
 
 MODEL = "claude-sonnet-5-5"
 RETRY_SESSION_PREFIX = "retry-"
@@ -55,6 +62,7 @@ READ_RETRY_SESSION_PREFIX = "read-retry-"
 READ_UNAVAILABLE_SESSION_PREFIX = "read-unavailable-"
 BROKEN_WRITES_LOG_NAME = "slack-broken-writes.log"
 STATE_DIR_ENVIRONMENT_VARIABLE = "DEMO_TEST_STATE_DIR"
+EXTRA_BINDINGS_ENVIRONMENT_VARIABLE = "DEMO_TEST_EXTRA_BINDINGS"
 SLACK_POSTS_LOG_NAME = "slack-posts.log"
 
 
@@ -163,25 +171,58 @@ def answer_slack_request(request: httpx.Request) -> httpx.Response:
     )
 
 
-def build_scripted_agent_flow() -> AgentSessionFlow:
+def build_retry_safe_slack_manifest() -> ConnectorManifest:
+    """Slack's manifest with postThreadReply reviewed as retry-safe, which no real one declares."""
+    manifest = load_connector_manifest("dex_connectors.slack")
+    post_thread_reply = manifest.operations["postThreadReply"]
+    review = post_thread_reply.agent_review
+    if review is None:
+        raise AssertionError("Slack postThreadReply lost its agent review")
+    operations = dict(manifest.operations)
+    operations["postThreadReply"] = replace(
+        post_thread_reply, agent_review=replace(review, is_retry_safe=True)
+    )
+    return replace(manifest, operations=operations)
+
+
+def build_scripted_agent_flow(extra_tool_prefixes: Collection[str] = ()) -> AgentSessionFlow:
+    """Build the agent with the Slack mock, plus the extra bindings one test module needs.
+
+    Args:
+        extra_tool_prefixes: ``"slackapi"`` adds the real Slack client with a
+            retry-safe test manifest; ``"slackbroken"`` adds the write that
+            returns a foreign receipt.
+    """
     bindings = [
         ConnectorBinding(
             tool_prefix="slack",
             package="dex_connectors.slack",
             connection=build_scripted_slack_mock().connection(),
             enabled_operation_ids=ENABLED_OPERATIONS["slack"],
-        ),
-        ConnectorBinding(
-            tool_prefix="slackapi",
-            package="dex_connectors.slack",
-            connection=build_scripted_slack_api_connection(),
-            enabled_operation_ids=("postThreadReply",),
-        ),
-        ConnectorBinding(
-            tool_prefix="slackbroken",
-            package="dex_connectors.slack",
-            connection=build_broken_slack_connection(),
-            enabled_operation_ids=("postThreadReply",),
-        ),
+        )
     ]
+    if "slackapi" in extra_tool_prefixes:
+        bindings.append(
+            ConnectorBinding(
+                tool_prefix="slackapi",
+                package="dex_connectors.slack",
+                connection=build_scripted_slack_api_connection(),
+                enabled_operation_ids=("postThreadReply",),
+                manifest=build_retry_safe_slack_manifest(),
+            )
+        )
+    if "slackbroken" in extra_tool_prefixes:
+        bindings.append(
+            ConnectorBinding(
+                tool_prefix="slackbroken",
+                package="dex_connectors.slack",
+                connection=build_broken_slack_connection(),
+                enabled_operation_ids=("postThreadReply",),
+            )
+        )
     return build_agent_flow(bindings, model=MODEL, max_budget_usd=1.0)
+
+
+def extra_tool_prefixes_from_environment() -> list[str]:
+    value = os.environ.get(EXTRA_BINDINGS_ENVIRONMENT_VARIABLE, "")
+    return [prefix for prefix in value.split(",") if prefix]

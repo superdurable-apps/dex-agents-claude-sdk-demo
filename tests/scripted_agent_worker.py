@@ -2,7 +2,10 @@
 
 from dex_agents.testing import run_agent_worker
 
-from tests.scripted_agent import build_scripted_agent_flow
+from tests.scripted_agent import (
+    build_scripted_agent_flow,
+    extra_tool_prefixes_from_environment,
+)
 
 if __name__ == "__main__":
-    run_agent_worker([build_scripted_agent_flow()])
+    run_agent_worker([build_scripted_agent_flow(extra_tool_prefixes_from_environment())])

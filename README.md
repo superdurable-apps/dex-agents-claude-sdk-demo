@@ -20,18 +20,34 @@ into a Claude Agent SDK custom tool:
 | Connector operation | Tool | Dex policy | Where it runs |
 | --- | --- | --- | --- |
 | Query, such as Hacker News `getItem` | `hackernews_get_item` | `READ` | Inside the model turn, through `run_query` |
-| Mutation, such as Slack `postThreadReply` | `slack_post_thread_reply` | `IDEMPOTENT_WRITE`, approval required | Its own `CallTool` Step after `AwaitToolApproval`, through `run_mutation` |
+| Mutation, such as Slack `postThreadReply` | `slack_post_thread_reply` | `NON_IDEMPOTENT_WRITE`, approval required | Its own `CallSingleAttemptTool` Step after `AwaitToolApproval`, through `run_mutation` |
 
 - The tool's input schema is the manifest's `inputSchema`. Arguments are
   decoded into the connector's input type with the Dex codec.
 - The tool description is the manifest description, or the connector author's
   agent description when the manifest has one.
 - A mutation's connector `CallID` is a UUIDv5 of the session's idempotency key
-  `<session>/<turn>/<tool call>`. Every Dex retry of the Step sends the same
-  connector idempotency key.
-- A mutation also gets the Step's heartbeat checkpoints, so a connector's
-  single-dispatch fence carries over to the next attempt of the Step: it sends
-  again only when the earlier attempt proved nothing was sent.
+  `<session>/<turn>/<tool call>`, the connector's idempotency key.
+- A mutation also gets the Step's heartbeat checkpoints, which a connector's
+  single-dispatch fence reads and writes.
+
+### Writes run once
+
+Every mutation runs at most once. When a write fails in a way the connector
+would retry, the session records the call as `outcome_unknown`, and the model
+reads that the outcome is unknown and the call will not be retried. The demo
+never sends that write again. A write whose outcome the connector cannot
+confirm is reported as unknown the same way.
+
+The reason: a connector's retry policy is not always safe for an agent. Some
+connectors resend after a check that can lag. Gmail searches Sent Mail after a
+503, and YouTube `addPlaylistItem` lists the playlist after a malformed insert
+answer. A retried Step could then send the email or insert the video twice.
+
+A mutation runs as `IDEMPOTENT_WRITE` (up to 3 attempts, the same `CallID`, the
+connector's fence carried across attempts) only when the connector author's
+agent review in `dex-connector.json` declares `"retry": "safe"`. No operation
+used here declares it today.
 
 Results become what the model reads:
 
@@ -40,7 +56,7 @@ Results become what the model reads:
 | The happy-path branch | `{"branch": ..., "value": ...}` as JSON |
 | A branch the manifest marks `rejected`, or any other query branch | An error result with the connector's safe failure message. A rejected mutation says nothing was changed. |
 | `uncertain`, `defect`, or another mutation branch the manifest does not classify | An error result that says the outcome is unknown and tells the model not to call the tool again. A mutation `defect` is always unknown, even when the manifest marks it `rejected`, because `run_mutation` also selects it after the operation ran, such as for an invalid receipt. |
-| `RetryError` in a mutation | Raised, so Dex retries the Step with the same `CallID`. After 3 attempts the session records `outcome_unknown`. |
+| `RetryError` in a mutation | Raised, so the attempt fails and the session records `outcome_unknown`; see [Writes run once](#writes-run-once) |
 | `RetryError` in an inline query | Retried in place up to 3 times, then an error result that says nothing was changed |
 | Output longer than 16,000 characters | A JSON object with `"truncated": true`, the original length, and a bounded `preview` |
 
@@ -126,7 +142,7 @@ connections and refresh drivers instead.
 | Hacker News | `listStoryIDs`, `getItem` | none | Public API |
 | Slack | `listThreadMessages`, `getThreadReply` (user token); `postChannelMessage`, `postThreadReply` (bot token) | `SLACK_USER_TOKEN`, `SLACK_BOT_TOKEN` | Create an app at <https://api.slack.com/apps>. Add bot scopes `channels:history`, `groups:history`, `channels:read`, `groups:read`, `users:read`, `chat:write`, and user scopes `channels:history`, `groups:history`. Install it, copy the Bot User OAuth Token (`xoxb-`) and User OAuth Token (`xoxp-`), and invite the bot to the channel. |
 | Gmail | `getMessage`, `sendMessage`, `replyToMessage` | `GMAIL_ACCESS_TOKEN`, `GMAIL_PRIMARY_EMAIL` | In the [OAuth 2.0 Playground](https://developers.google.com/oauthplayground), authorize `https://www.googleapis.com/auth/gmail.readonly` and `https://www.googleapis.com/auth/gmail.send`, then exchange the code for an access token. Set the mailbox address too. Tokens last about an hour. |
-| YouTube | `searchVideos`, `getVideo`, `getChannel`, `listPlaylistItems` | `YOUTUBE_ACCESS_TOKEN` | In the OAuth 2.0 Playground, authorize `https://www.googleapis.com/auth/youtube.readonly`. `addPlaylistItem` is not offered: after an insert that took effect but returned a malformed answer, the connector asks for a retry and checks only a playlist listing that can lag, so a retried Step can insert the video twice. |
+| YouTube | `searchVideos`, `getVideo`, `getChannel`, `listPlaylistItems`; `addPlaylistItem` | `YOUTUBE_ACCESS_TOKEN`, `YOUTUBE_AUTH_METHOD` | In the OAuth 2.0 Playground, authorize `https://www.googleapis.com/auth/youtube.readonly`. For `addPlaylistItem`, authorize `https://www.googleapis.com/auth/youtube` and set `YOUTUBE_AUTH_METHOD=google-oauth-manage`. |
 | Reddit | `getPost` | `REDDIT_ACCESS_TOKEN`, `REDDIT_CLIENT_ID`, `REDDIT_USERNAME` | Create a script app at <https://www.reddit.com/prefs/apps> and get a token with the `read` scope from `https://www.reddit.com/api/v1/access_token` ([OAuth2 guide](https://github.com/reddit-archive/reddit/wiki/OAuth2)). The client ID and username build the required User-Agent. |
 | Spotify | `listPlaylistTracks` | `SPOTIFY_ACCESS_TOKEN` | Create an app in the [Spotify developer dashboard](https://developer.spotify.com/dashboard) and get a user token with the `playlist-read-private` scope through the [authorization code flow](https://developer.spotify.com/documentation/web-api/tutorials/code-flow). |
 
@@ -143,14 +159,16 @@ uv run ruff check src tests
 ```
 
 They cover an inline query, a query failure branch, a mutation that waits for
-approval and runs once with the expected `CallID`, a connector retry that
-reruns the Step with the same `CallID`, a rejection, a provider rejection, and
-an uncertain outcome. They also cover an inline query that retries in place,
-one that runs out of retries, a mutation that writes and then returns an
-invalid receipt (reported as an unknown outcome), and output truncation. One
-more test runs the real Slack client against a scripted HTTP transport: its
-first post gets a 503, and the retried Step posts again only because the
-fence's checkpoint from the first attempt allows it.
+approval and runs once with the expected `CallID`, a connector retry of a
+mutation that ends as `outcome_unknown` without a second call, a rejection, a
+provider rejection, and an uncertain outcome. They also cover an inline query
+that retries in place, one that runs out of retries, a mutation that writes and
+then returns an invalid receipt (reported as an unknown outcome), output
+truncation, and the policy rule. `tests/test_retry_safe_writes.py` reviews Slack
+`postThreadReply` as retry-safe in a test manifest and runs the real Slack
+client against a scripted HTTP transport: its first post gets a 503, and the
+retried Step posts again only because the fence's checkpoint from the first
+attempt allows it.
 
 Known gaps:
 

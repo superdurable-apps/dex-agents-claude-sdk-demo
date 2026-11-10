@@ -8,11 +8,14 @@ from __future__ import annotations
 
 import json
 
+from dex_agents import OUTCOME_UNKNOWN_TOOL_RESULT, ToolEffect, ToolPolicy
 from dex_connectors.slack import Message
 
 from claude_connectors_demo.connector_tools import (
     MAX_TOOL_OUTPUT_CHARACTERS,
+    ConnectorBinding,
     _encode_output,
+    build_connector_toolset,
     connector_call_id,
 )
 from tests.conftest import DUMMY_API_KEY, AgentHarness
@@ -23,6 +26,8 @@ from tests.scripted_agent import (
     READ_UNAVAILABLE_SESSION_PREFIX,
     RETRY_SESSION_PREFIX,
     UNKNOWN_OUTCOME_SESSION_PREFIX,
+    build_retry_safe_slack_manifest,
+    build_scripted_slack_mock,
 )
 
 THREAD = {"channelId": "C0123456789", "threadTimestamp": "1710000000.000100"}
@@ -57,6 +62,11 @@ async def test_query_tool_runs_inline_without_approval(harness: AgentHarness) ->
         "mcp__tools__slack_post_thread_reply",
     } <= offered_tools
     assert not offered_tools & {"Bash", "Read", "Write", "WebFetch"}
+    # Bindings other test modules add stay out of this module's Worker.
+    assert not any(
+        name.startswith(("mcp__tools__slackapi_", "mcp__tools__slackbroken_"))
+        for name in offered_tools
+    )
     _assert_only_the_scripted_api_was_reached(harness)
 
 
@@ -94,12 +104,13 @@ async def test_mutation_waits_for_approval_then_runs_once_with_a_stable_call_id(
     expected_call_id = connector_call_id(f"{session_id}/{turn_id}/{interrupt.tool_call_id}")
     assert [call["callId"] for call in calls] == [expected_call_id]
     assert ("AwaitToolApproval", 1) in await harness.executed_steps(session_id)
-    assert ("CallTool", 1) in await harness.executed_steps(session_id)
+    assert ("CallSingleAttemptTool", 1) in await harness.executed_steps(session_id)
 
 
-async def test_connector_retry_retries_the_step_with_the_same_call_id(
+async def test_connector_retry_of_a_write_ends_as_unknown_without_a_second_call(
     harness: AgentHarness,
 ) -> None:
+    """A write without a retry-safe review runs once: a RetryError is an unknown outcome."""
     session_id = harness.new_session_id(RETRY_SESSION_PREFIX)
     await harness.sessions.start_session(session_id, POST_REPLY_PROMPT)
     interrupt, turn_id = await harness.wait_for_pending_interrupt(session_id)
@@ -109,16 +120,17 @@ async def test_connector_retry_retries_the_step_with_the_same_call_id(
 
     snapshot = await harness.wait_for_turns(session_id, 1)
 
-    assert (
-        json.loads((snapshot.messages[-1].text or "").removeprefix("result: "))["branch"] == "sent"
-    )
+    answer = snapshot.messages[-1].text or ""
+    assert answer == f"error result: {OUTCOME_UNKNOWN_TOOL_RESULT}", answer
     calls = harness.connector_calls(session_id, "postThreadReply")
     expected_call_id = connector_call_id(f"{session_id}/{turn_id}/{interrupt.tool_call_id}")
     assert [(call["callId"], call.get("retry", False)) for call in calls] == [
-        (expected_call_id, True),
-        (expected_call_id, False),
+        (expected_call_id, True)
     ]
-    assert ("CallTool", 2) in await harness.executed_steps(session_id)
+    executed = await harness.executed_steps(session_id)
+    # The failed CallSingleAttemptTool attempt goes to its failure route; nothing retries it.
+    assert ("RecordToolOutcomeUnknown", 1) in executed
+    assert "CallTool" not in [step for step, _ in executed]
 
 
 async def test_rejected_mutation_never_runs(harness: AgentHarness) -> None:
@@ -136,7 +148,9 @@ async def test_rejected_mutation_never_runs(harness: AgentHarness) -> None:
 
     assert "Do not post in that thread." in (snapshot.messages[-1].text or "")
     assert harness.connector_calls(session_id, "postThreadReply") == []
-    assert "CallTool" not in [step for step, _ in await harness.executed_steps(session_id)]
+    executed = [step for step, _ in await harness.executed_steps(session_id)]
+    assert "CallSingleAttemptTool" not in executed
+    assert "CallTool" not in executed
 
 
 async def test_provider_rejection_reaches_the_model_as_a_failure(harness: AgentHarness) -> None:
@@ -202,29 +216,6 @@ async def test_inline_query_reports_a_temporary_failure_after_its_retries(
     assert len(harness.connector_calls(session_id, "listThreadMessages")) == 3
 
 
-async def test_mutation_defect_after_the_write_is_an_unknown_outcome(
-    harness: AgentHarness,
-) -> None:
-    """Slack's manifest calls defect rejected, but run_mutation can select it after a write."""
-    session_id = harness.new_session_id("defect-")
-    prompt = "call slackbroken_post_thread_reply " + json.dumps({**THREAD, "text": "Broken."})
-    await harness.sessions.start_session(session_id, prompt)
-    interrupt, turn_id = await harness.wait_for_pending_interrupt(session_id)
-    assert await harness.sessions.resolve_interrupt(
-        session_id, interrupt.interrupt_id, approved=True
-    )
-
-    snapshot = await harness.wait_for_turns(session_id, 1)
-
-    answer = snapshot.messages[-1].text or ""
-    assert answer.startswith("error result: "), answer
-    assert "The outcome of slackbroken_post_thread_reply is unknown" in answer
-    assert "returned 'defect'" in answer
-    assert "Nothing was changed" not in answer
-    expected_call_id = connector_call_id(f"{session_id}/{turn_id}/{interrupt.tool_call_id}")
-    assert harness.broken_slack_writes().count(expected_call_id) == 1
-
-
 def test_long_output_stays_valid_json() -> None:
     long_text = "x" * (MAX_TOOL_OUTPUT_CHARACTERS * 2)
 
@@ -241,30 +232,44 @@ def test_long_output_stays_valid_json() -> None:
     assert "truncated" not in short
 
 
+def test_long_output_of_quotes_and_backslashes_stays_within_the_limit() -> None:
+    encoded = _encode_output("found", Message(text='"\\' * MAX_TOOL_OUTPUT_CHARACTERS))
+
+    assert len(encoded) <= MAX_TOOL_OUTPUT_CHARACTERS
+    document = json.loads(encoded)
+    assert document["truncated"] is True
+    assert document["preview"]
+
+
+def test_writes_run_once_unless_the_manifest_reviews_them_retry_safe() -> None:
+    toolset = build_connector_toolset(
+        [
+            ConnectorBinding(
+                tool_prefix="slack",
+                package="dex_connectors.slack",
+                connection=build_scripted_slack_mock().connection(),
+                enabled_operation_ids=("listThreadMessages", "postThreadReply"),
+            ),
+            ConnectorBinding(
+                tool_prefix="reviewed",
+                package="dex_connectors.slack",
+                connection=build_scripted_slack_mock().connection(),
+                enabled_operation_ids=("postThreadReply",),
+                manifest=build_retry_safe_slack_manifest(),
+            ),
+        ]
+    )
+
+    assert toolset.policies["slack_list_thread_messages"] == ToolPolicy(ToolEffect.READ)
+    assert toolset.policies["slack_post_thread_reply"] == ToolPolicy(
+        ToolEffect.NON_IDEMPOTENT_WRITE, requires_approval=True
+    )
+    assert toolset.policies["reviewed_post_thread_reply"] == ToolPolicy(
+        ToolEffect.IDEMPOTENT_WRITE, requires_approval=True
+    )
+
+
 def _assert_only_the_scripted_api_was_reached(harness: AgentHarness) -> None:
     requests = harness.messages_api.requests
     assert requests
     assert {request.api_key for request in requests} == {DUMMY_API_KEY}
-
-
-async def test_real_slack_client_resends_only_after_its_fence_checkpoint(
-    harness: AgentHarness,
-) -> None:
-    """The Slack fence's canResend marker must survive into the next Step attempt."""
-    session_id = harness.new_session_id("fence-")
-    prompt = "call slackapi_post_thread_reply " + json.dumps({**THREAD, "text": "Fenced reply."})
-    await harness.sessions.start_session(session_id, prompt)
-    interrupt, turn_id = await harness.wait_for_pending_interrupt(session_id)
-    assert await harness.sessions.resolve_interrupt(
-        session_id, interrupt.interrupt_id, approved=True
-    )
-
-    snapshot = await harness.wait_for_turns(session_id, 1)
-
-    answer = snapshot.messages[-1].text or ""
-    output = json.loads(answer.removeprefix("result: "))
-    assert output["branch"] == "sent", answer
-    assert output["value"]["message"]["text"] == "Fenced reply."
-    expected_call_id = connector_call_id(f"{session_id}/{turn_id}/{interrupt.tool_call_id}")
-    assert harness.slack_api_posts().count(expected_call_id) == 2
-    assert ("CallTool", 2) in await harness.executed_steps(session_id)

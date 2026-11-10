@@ -24,6 +24,7 @@ from dex_agents.testing import EXECUTE_COMPLETED_EVENT, AgentTestStack, wait_for
 
 from tests.scripted_agent import (
     BROKEN_WRITES_LOG_NAME,
+    EXTRA_BINDINGS_ENVIRONMENT_VARIABLE,
     SLACK_POSTS_LOG_NAME,
     STATE_DIR_ENVIRONMENT_VARIABLE,
     build_scripted_agent_flow,
@@ -128,8 +129,15 @@ def messages_api() -> Iterator[ScriptedMessagesApi]:
 
 @pytest_asyncio.fixture(scope="module")
 async def harness(
-    tmp_path_factory: pytest.TempPathFactory, messages_api: ScriptedMessagesApi
+    request: pytest.FixtureRequest,
+    tmp_path_factory: pytest.TempPathFactory,
+    messages_api: ScriptedMessagesApi,
 ) -> AsyncIterator[AgentHarness]:
+    """A private engine and Worker per test module.
+
+    A module sets ``EXTRA_TOOL_PREFIXES`` to add the bindings only it needs.
+    """
+    extra_tool_prefixes = tuple(getattr(request.module, "EXTRA_TOOL_PREFIXES", ()))
     state_dir = tmp_path_factory.mktemp("agent")
     claude_home = state_dir / "home"
     (claude_home / ".claude").mkdir(parents=True)
@@ -150,8 +158,9 @@ async def harness(
         "CLAUDE_AGENT_SDK_SKIP_VERSION_CHECK": "1",
         "DEX_CONNECTOR_MOCK_REPORT_DIR": str(mock_report_dir),
         STATE_DIR_ENVIRONMENT_VARIABLE: str(state_dir),
+        EXTRA_BINDINGS_ENVIRONMENT_VARIABLE: ",".join(extra_tool_prefixes),
     }
-    flow = build_scripted_agent_flow()
+    flow = build_scripted_agent_flow(extra_tool_prefixes)
     async with AgentTestStack(
         state_dir, [flow], WORKER_MODULE, worker_cwd=PROJECT_DIR, worker_env=worker_env
     ) as stack:

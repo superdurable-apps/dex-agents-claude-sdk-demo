@@ -39,8 +39,7 @@ ENABLED_OPERATIONS: Mapping[str, tuple[str, ...]] = {
     "hackernews": ("listStoryIDs", "getItem"),
     "slack": ("listThreadMessages", "getThreadReply", "postChannelMessage", "postThreadReply"),
     "gmail": ("getMessage", "sendMessage", "replyToMessage"),
-    # No addPlaylistItem: a retry after an accepted insert can insert the video twice.
-    "youtube": ("searchVideos", "getVideo", "getChannel", "listPlaylistItems"),
+    "youtube": ("searchVideos", "getVideo", "getChannel", "listPlaylistItems", "addPlaylistItem"),
     "reddit": ("getPost",),
     "spotify": ("listPlaylistTracks",),
 }
@@ -49,7 +48,7 @@ ENABLED_OPERATIONS: Mapping[str, tuple[str, ...]] = {
 SECRET_ENVIRONMENT_VARIABLES: Mapping[str, Mapping[str, str]] = {
     "slack": {"bot_token": "SLACK_BOT_TOKEN", "user_token": "SLACK_USER_TOKEN"},
     "gmail": {"access_token": "GMAIL_ACCESS_TOKEN", "primary_email": "GMAIL_PRIMARY_EMAIL"},
-    "youtube": {"access_token": "YOUTUBE_ACCESS_TOKEN"},
+    "youtube": {"access_token": "YOUTUBE_ACCESS_TOKEN", "auth_method": "YOUTUBE_AUTH_METHOD"},
     "reddit": {
         "access_token": "REDDIT_ACCESS_TOKEN",
         "client_id": "REDDIT_CLIENT_ID",
@@ -186,7 +185,7 @@ def _youtube_connection(secrets: ConnectorSecrets) -> object | None:
         return None
     reference = ConnectionRef("google", CONNECTION_NAME)
     credentials = google_youtube.Credentials(
-        auth_method_id="google-oauth-readonly",
+        auth_method_id=secrets.get("auth_method") or "google-oauth-readonly",
         access_token=SecretString(secrets.get("access_token")),
     )
     client = google_youtube.Client(
