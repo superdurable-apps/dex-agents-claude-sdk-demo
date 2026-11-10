@@ -22,7 +22,11 @@ import pytest_asyncio
 from dex_agents import AgentInterrupt, AgentSessionClient, AgentSessionFlow, AgentSnapshot
 from dex_agents.testing import EXECUTE_COMPLETED_EVENT, AgentTestStack, wait_for_agent_snapshot
 
-from tests.scripted_agent import build_scripted_agent_flow
+from tests.scripted_agent import (
+    SLACK_POSTS_LOG_NAME,
+    STATE_DIR_ENVIRONMENT_VARIABLE,
+    build_scripted_agent_flow,
+)
 from tests.scripted_messages_api import ScriptedMessagesApi
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
@@ -38,6 +42,7 @@ class AgentHarness:
     sessions: AgentSessionClient
     messages_api: ScriptedMessagesApi
     mock_report_dir: Path
+    state_dir: Path
 
     def new_session_id(self, prefix: str = "session-") -> str:
         return f"{prefix}{uuid4().hex[:12]}"
@@ -82,6 +87,11 @@ class AgentHarness:
             for row in rows
             if row.get("flowId") == session_id and row["operation"] == operation_id
         ]
+
+    def slack_api_posts(self) -> list[str]:
+        """Return the client_msg_id of every chat.postMessage the Slack client sent."""
+        posts_log = self.state_dir / SLACK_POSTS_LOG_NAME
+        return posts_log.read_text().split() if posts_log.exists() else []
 
     async def executed_steps(self, session_id: str) -> list[tuple[str, int]]:
         history = await self.stack.read_step_history(session_id)
@@ -133,10 +143,13 @@ async def harness(
         "NO_PROXY": "127.0.0.1,localhost",
         "CLAUDE_AGENT_SDK_SKIP_VERSION_CHECK": "1",
         "DEX_CONNECTOR_MOCK_REPORT_DIR": str(mock_report_dir),
+        STATE_DIR_ENVIRONMENT_VARIABLE: str(state_dir),
     }
     flow = build_scripted_agent_flow()
     async with AgentTestStack(
         state_dir, [flow], WORKER_MODULE, worker_cwd=PROJECT_DIR, worker_env=worker_env
     ) as stack:
         await stack.start_worker()
-        yield AgentHarness(stack, flow, stack.sessions(flow), messages_api, mock_report_dir)
+        yield AgentHarness(
+            stack, flow, stack.sessions(flow), messages_api, mock_report_dir, state_dir
+        )

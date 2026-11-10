@@ -30,7 +30,8 @@ into a Claude Agent SDK custom tool:
   `<session>/<turn>/<tool call>`. Every Dex retry of the Step sends the same
   connector idempotency key.
 - A mutation also gets the Step's heartbeat checkpoints, so a connector's
-  single-dispatch fence works across retries and Worker restarts.
+  single-dispatch fence carries over to the next attempt of the Step: it sends
+  again only when the earlier attempt proved nothing was sent.
 
 Results become what the model reads:
 
@@ -143,7 +144,9 @@ uv run ruff check src tests
 They cover an inline query, a query failure branch, a mutation that waits for
 approval and runs once with the expected `CallID`, a connector retry that
 reruns the Step with the same `CallID`, a rejection, a provider rejection, and
-an uncertain outcome.
+an uncertain outcome. One more test runs the real Slack client against a
+scripted HTTP transport: its first post gets a 503, and the retried Step posts
+again only because the fence's checkpoint from the first attempt allows it.
 
 ## Notes and limits
 
@@ -156,8 +159,9 @@ an uncertain outcome.
 - A tool handler has no Dex run ID or Flow start time. Connectors that use
   them for a provider-side identity, such as Gmail's Message-ID, get values that
   stay the same for every attempt of one tool call.
-- A turn that continues after an approval runs the Claude Code CLI with a
-  temporary configuration directory that the Claude Agent SDK prepares.
-  `ANTHROPIC_API_KEY` in the environment carries over to it.
+- Every turn after the first, and every continuation after an approval, runs
+  the Claude Code CLI with a temporary configuration directory that the Claude
+  Agent SDK prepares from the stored transcript. `ANTHROPIC_API_KEY` in the
+  environment carries over to it.
 - The connectors' Dex Web connections, OAuth refresh, and Triggers are not
   used here.
