@@ -63,6 +63,28 @@ Results become what the model reads:
 The operations each connector offers are listed explicitly in
 `ENABLED_OPERATIONS` in `src/claude_connectors_demo/connections.py`.
 
+### Unreviewed operations (temporary)
+
+A connector author reviews an operation for agent use in the `agent` block of
+its manifest entry: `exposed`, `approval`, `retry`, `description`, and
+`branches`. The manifest schema says an operation without that block is not
+offered to agents. Of the operations used here, only Slack `postThreadReply`
+has one today.
+
+This demo relaxes that rule on purpose and offers the operations in
+`ENABLED_OPERATIONS` whether or not they are reviewed. It stays safe because
+every write needs approval, runs once, and reports an unconfirmed outcome as
+unknown. What an unreviewed operation loses is the author's tool description
+and branch classification, so its unclassified mutation branches read as
+unknown. An operation reviewed with `exposed: false` should not be offered;
+the demo does not check that flag yet.
+
+The Dex agents core is adding connector tools (`ConnectorToolSource`, see
+superdurable/dex#1391), which offers only operations reviewed with
+`exposed: true`. Once that ships, the Claude Agent SDK adapter can use it, and
+the connectors used here carry reviews, this demo will switch to it, drop its
+own bridge, and follow the rule strictly.
+
 ## Requirements
 
 - [uv](https://docs.astral.sh/uv/) and Python 3.11 or later.
