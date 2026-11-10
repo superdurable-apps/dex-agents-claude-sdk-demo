@@ -1,5 +1,13 @@
 # dex-agents-claude-sdk-demo
 
+> **This repository is archived.** Its example moved into the Dex repository, where it is maintained and tested with every release:
+>
+> - Claude Agent SDK harness with Dex Connector tools: [examples/python/agent-harnesses](https://github.com/superdurable/dex/tree/main/examples/python/agent-harnesses) (Python) and [examples/typescript/src/products/agent-harnesses](https://github.com/superdurable/dex/tree/main/examples/typescript/src/products/agent-harnesses) (TypeScript).
+> - Docs: [Claude Agent SDK](https://docs.superdurable.io/agent-frameworks/claude-agent-sdk) and the other [agent frameworks](https://docs.superdurable.io/agent-frameworks).
+>
+> Connector operations are now offered to agents through `ConnectorToolSource` in the Dex agents packages (0.4.0 and later), so the hand-written bridge below is no longer needed.
+
+
 A durable [Claude Agent SDK](https://github.com/anthropics/claude-agent-sdk-python)
 agent that runs on [Dex](https://github.com/superdurable/dex) through
 [`dex-agents-claude-agent-sdk`](https://pypi.org/project/dex-agents-claude-agent-sdk/).
