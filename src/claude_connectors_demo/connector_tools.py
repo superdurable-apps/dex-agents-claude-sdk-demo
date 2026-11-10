@@ -21,7 +21,8 @@ Results map to what the model reads:
   safe failure message.
 * A Mutation branch classified ``unknown``, or unclassified, returns an error
   result that says plainly that the outcome is unknown and must not be blindly
-  retried.
+  retried. A Mutation ``defect`` is always unknown, whatever the manifest says,
+  because ``run_mutation`` also selects it after the operation ran.
 * A connector ``RetryError`` in a tool Step propagates, so Dex retries the Step
   with the same ``CallID``. An inline read cannot fail its Step, so it retries
   in place a few times and then reports a temporary failure.
@@ -66,6 +67,8 @@ MANIFEST_FILE_NAME = "dex-connector.json"
 # Namespace of connector Call IDs derived from agent session idempotency keys.
 AGENT_TOOL_CALL_ID_NAMESPACE = UUID("6f1d3c2e-5b7a-4e1f-9a3c-8d2b0e4f7a61")
 MAX_TOOL_OUTPUT_CHARACTERS = 16_000
+TRUNCATED_OUTPUT_PREVIEW_CHARACTERS = 12_000
+DEFECT_BRANCH_ID = "defect"
 INLINE_READ_ATTEMPTS = 3
 INLINE_READ_MAX_RETRY_DELAY = timedelta(seconds=5)
 
@@ -100,6 +103,9 @@ class ConnectorOperationManifest:
         """Classify a returned branch by whether the operation's effect may have happened."""
         if branch_id == self.happy_branch_id:
             return "succeeded"
+        # run_mutation also returns defect after invoke ran, when the write may have happened.
+        if self.kind == "mutation" and branch_id == DEFECT_BRANCH_ID:
+            return "unknown"
         reviewed_class = (
             None if self.agent_review is None else self.agent_review.branch_classes.get(branch_id)
         )
@@ -380,9 +386,18 @@ def _encode_output(branch_id: str, value: object) -> str:
             cast(str, CodecRegistry().resolve(type(value)).encode(value).data)
         )
     text = json.dumps({"branch": branch_id, "value": encoded_value}, ensure_ascii=False)
-    if len(text) > MAX_TOOL_OUTPUT_CHARACTERS:
-        return text[:MAX_TOOL_OUTPUT_CHARACTERS] + " ...[output truncated]"
-    return text
+    if len(text) <= MAX_TOOL_OUTPUT_CHARACTERS:
+        return text
+    # Stay valid JSON: a cut JSON document would mislead the model.
+    return json.dumps(
+        {
+            "branch": branch_id,
+            "truncated": True,
+            "originalLength": len(text),
+            "preview": text[:TRUNCATED_OUTPUT_PREVIEW_CHARACTERS],
+        },
+        ensure_ascii=False,
+    )
 
 
 def _text_result(text: str, *, is_error: bool) -> dict[str, Any]:

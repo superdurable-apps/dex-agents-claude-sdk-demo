@@ -9,25 +9,38 @@ HTTP transport instead. Its single-dispatch fence needs the session tool Step's
 heartbeat checkpoints, which ``slackmock`` never uses. The transport answers
 the first ``chat.postMessage`` of each ``client_msg_id`` with 503 and later
 ones with success, and logs every ``client_msg_id`` to ``slack-posts.log``.
+
+``slackbroken_post_thread_reply`` writes (it logs to ``slack-broken-writes.log``)
+and then returns a receipt for another call, so ``run_mutation`` turns the
+accepted write into ``defect``.
 """
 
 from __future__ import annotations
 
 import json
 import os
+from datetime import UTC, datetime
 from pathlib import Path
+from uuid import uuid4
 
 import httpx
 from dex_agents import AgentSessionFlow
 from dex_connectors import slack
 from dex_connectors.sdk import (
+    Call,
+    CallID,
     ConnectionRef,
     Failure,
     FailureKind,
+    IdempotencyKey,
+    MutationAttempt,
+    MutationDefinition,
+    Receipt,
     SecretString,
     StaticCredentialProvider,
 )
 from dex_connectors.slack import slackmock
+from dex_connectors.slack._generated.definitions import POST_THREAD_REPLY_DEFINITION
 
 from claude_connectors_demo.agent import build_agent_flow
 from claude_connectors_demo.connections import CONNECTION_NAME, ENABLED_OPERATIONS
@@ -38,6 +51,9 @@ RETRY_SESSION_PREFIX = "retry-"
 PROVIDER_REJECTED_SESSION_PREFIX = "rejected-branch-"
 UNKNOWN_OUTCOME_SESSION_PREFIX = "unknown-"
 READ_REJECTED_SESSION_PREFIX = "read-rejected-"
+READ_RETRY_SESSION_PREFIX = "read-retry-"
+READ_UNAVAILABLE_SESSION_PREFIX = "read-unavailable-"
+BROKEN_WRITES_LOG_NAME = "slack-broken-writes.log"
 STATE_DIR_ENVIRONMENT_VARIABLE = "DEMO_TEST_STATE_DIR"
 SLACK_POSTS_LOG_NAME = "slack-posts.log"
 
@@ -61,7 +77,49 @@ def build_scripted_slack_mock() -> slackmock.Mock:
     mock.list_thread_messages_script.for_flow(READ_REJECTED_SESSION_PREFIX).respond(
         slackmock.list_thread_messages_read_rejected()
     )
+    read_unavailable = Failure(
+        FailureKind.AVAILABILITY, "slack", "listThreadMessages", "Slack is temporarily unavailable"
+    )
+    mock.list_thread_messages_script.for_flow(READ_RETRY_SESSION_PREFIX).respond(
+        slackmock.list_thread_messages_retry(read_unavailable),
+        slackmock.list_thread_messages_approval_thread(),
+    )
+    mock.list_thread_messages_script.for_flow(READ_UNAVAILABLE_SESSION_PREFIX).respond(
+        *(slackmock.list_thread_messages_retry(read_unavailable) for _ in range(3))
+    )
     return mock
+
+
+class WriteThenForeignReceiptMutation:
+    """A thread reply Mutation that writes, then returns another call's receipt."""
+
+    def definition(self) -> MutationDefinition:
+        return POST_THREAD_REPLY_DEFINITION
+
+    def idempotency_key(self, call_id: CallID, input: slack.PostThreadReplyInput) -> IdempotencyKey:
+        return IdempotencyKey(call_id)
+
+    async def invoke(
+        self, call: Call, input: slack.PostThreadReplyInput
+    ) -> MutationAttempt[slack.PostMessageOutput]:
+        writes_log = Path(os.environ[STATE_DIR_ENVIRONMENT_VARIABLE]) / BROKEN_WRITES_LOG_NAME
+        with writes_log.open("a") as log:
+            log.write(str(call.id) + "\n")
+        foreign_receipt = Receipt(CallID(str(uuid4())), "slack", datetime.now(UTC))
+        return MutationAttempt.branch_result(
+            "sent", slack.PostMessageOutput(slack.Message(text=input.text)), foreign_receipt
+        )
+
+
+def build_broken_slack_connection() -> slack.Connection:
+    operations = slackmock.Mock(CONNECTION_NAME).connection()
+    return slack.new_connection_with_operations(
+        operations.list_thread_messages(),
+        operations.get_thread_reply(),
+        operations.post_channel_message(),
+        WriteThenForeignReceiptMutation(),
+        operations.reference,
+    )
 
 
 def build_scripted_slack_api_connection() -> slack.Connection:
@@ -117,6 +175,12 @@ def build_scripted_agent_flow() -> AgentSessionFlow:
             tool_prefix="slackapi",
             package="dex_connectors.slack",
             connection=build_scripted_slack_api_connection(),
+            enabled_operation_ids=("postThreadReply",),
+        ),
+        ConnectorBinding(
+            tool_prefix="slackbroken",
+            package="dex_connectors.slack",
+            connection=build_broken_slack_connection(),
             enabled_operation_ids=("postThreadReply",),
         ),
     ]

@@ -8,11 +8,19 @@ from __future__ import annotations
 
 import json
 
-from claude_connectors_demo.connector_tools import connector_call_id
+from dex_connectors.slack import Message
+
+from claude_connectors_demo.connector_tools import (
+    MAX_TOOL_OUTPUT_CHARACTERS,
+    _encode_output,
+    connector_call_id,
+)
 from tests.conftest import DUMMY_API_KEY, AgentHarness
 from tests.scripted_agent import (
     PROVIDER_REJECTED_SESSION_PREFIX,
     READ_REJECTED_SESSION_PREFIX,
+    READ_RETRY_SESSION_PREFIX,
+    READ_UNAVAILABLE_SESSION_PREFIX,
     RETRY_SESSION_PREFIX,
     UNKNOWN_OUTCOME_SESSION_PREFIX,
 )
@@ -163,6 +171,74 @@ async def test_uncertain_mutation_says_the_outcome_is_unknown(harness: AgentHarn
     assert "The outcome of slack_post_thread_reply is unknown" in answer
     assert "Do not call slack_post_thread_reply again" in answer
     assert len(harness.connector_calls(session_id, "postThreadReply")) == 1
+
+
+async def test_inline_query_retries_in_place_after_a_connector_retry(
+    harness: AgentHarness,
+) -> None:
+    session_id = harness.new_session_id(READ_RETRY_SESSION_PREFIX)
+    await harness.sessions.start_session(session_id, READ_THREAD_PROMPT)
+
+    snapshot = await harness.wait_for_turns(session_id, 1)
+
+    answer = snapshot.messages[-1].text or ""
+    assert json.loads(answer.removeprefix("result: "))["branch"] == "read", answer
+    calls = harness.connector_calls(session_id, "listThreadMessages")
+    assert [call.get("retry", False) for call in calls] == [True, False]
+    assert "CallTool" not in [step for step, _ in await harness.executed_steps(session_id)]
+
+
+async def test_inline_query_reports_a_temporary_failure_after_its_retries(
+    harness: AgentHarness,
+) -> None:
+    session_id = harness.new_session_id(READ_UNAVAILABLE_SESSION_PREFIX)
+    await harness.sessions.start_session(session_id, READ_THREAD_PROMPT)
+
+    snapshot = await harness.wait_for_turns(session_id, 1)
+
+    answer = snapshot.messages[-1].text or ""
+    assert answer.startswith("error result: "), answer
+    assert "temporarily unavailable after 3 attempts" in answer
+    assert len(harness.connector_calls(session_id, "listThreadMessages")) == 3
+
+
+async def test_mutation_defect_after_the_write_is_an_unknown_outcome(
+    harness: AgentHarness,
+) -> None:
+    """Slack's manifest calls defect rejected, but run_mutation can select it after a write."""
+    session_id = harness.new_session_id("defect-")
+    prompt = "call slackbroken_post_thread_reply " + json.dumps({**THREAD, "text": "Broken."})
+    await harness.sessions.start_session(session_id, prompt)
+    interrupt, turn_id = await harness.wait_for_pending_interrupt(session_id)
+    assert await harness.sessions.resolve_interrupt(
+        session_id, interrupt.interrupt_id, approved=True
+    )
+
+    snapshot = await harness.wait_for_turns(session_id, 1)
+
+    answer = snapshot.messages[-1].text or ""
+    assert answer.startswith("error result: "), answer
+    assert "The outcome of slackbroken_post_thread_reply is unknown" in answer
+    assert "returned 'defect'" in answer
+    assert "Nothing was changed" not in answer
+    expected_call_id = connector_call_id(f"{session_id}/{turn_id}/{interrupt.tool_call_id}")
+    assert harness.broken_slack_writes().count(expected_call_id) == 1
+
+
+def test_long_output_stays_valid_json() -> None:
+    long_text = "x" * (MAX_TOOL_OUTPUT_CHARACTERS * 2)
+
+    encoded = _encode_output("found", Message(text=long_text))
+
+    assert len(encoded) <= MAX_TOOL_OUTPUT_CHARACTERS
+    document = json.loads(encoded)
+    assert document["branch"] == "found"
+    assert document["truncated"] is True
+    assert document["originalLength"] > MAX_TOOL_OUTPUT_CHARACTERS
+    assert document["preview"].startswith('{"branch": "found", "value": {')
+    short = json.loads(_encode_output("found", Message(text="short")))
+    assert short["value"]["text"] == "short"
+    assert "truncated" not in short
 
 
 def _assert_only_the_scripted_api_was_reached(harness: AgentHarness) -> None:

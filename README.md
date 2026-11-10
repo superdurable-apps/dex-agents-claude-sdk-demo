@@ -39,9 +39,10 @@ Results become what the model reads:
 | --- | --- |
 | The happy-path branch | `{"branch": ..., "value": ...}` as JSON |
 | A branch the manifest marks `rejected`, or any other query branch | An error result with the connector's safe failure message. A rejected mutation says nothing was changed. |
-| `uncertain`, or another mutation branch the manifest does not classify | An error result that says the outcome is unknown and tells the model not to call the tool again |
+| `uncertain`, `defect`, or another mutation branch the manifest does not classify | An error result that says the outcome is unknown and tells the model not to call the tool again. A mutation `defect` is always unknown, even when the manifest marks it `rejected`, because `run_mutation` also selects it after the operation ran, such as for an invalid receipt. |
 | `RetryError` in a mutation | Raised, so Dex retries the Step with the same `CallID`. After 3 attempts the session records `outcome_unknown`. |
 | `RetryError` in an inline query | Retried in place up to 3 times, then an error result that says nothing was changed |
+| Output longer than 16,000 characters | A JSON object with `"truncated": true`, the original length, and a bounded `preview` |
 
 The operations each connector offers are listed explicitly in
 `ENABLED_OPERATIONS` in `src/claude_connectors_demo/connections.py`.
@@ -125,7 +126,7 @@ connections and refresh drivers instead.
 | Hacker News | `listStoryIDs`, `getItem` | none | Public API |
 | Slack | `listThreadMessages`, `getThreadReply` (user token); `postChannelMessage`, `postThreadReply` (bot token) | `SLACK_USER_TOKEN`, `SLACK_BOT_TOKEN` | Create an app at <https://api.slack.com/apps>. Add bot scopes `channels:history`, `groups:history`, `channels:read`, `groups:read`, `users:read`, `chat:write`, and user scopes `channels:history`, `groups:history`. Install it, copy the Bot User OAuth Token (`xoxb-`) and User OAuth Token (`xoxp-`), and invite the bot to the channel. |
 | Gmail | `getMessage`, `sendMessage`, `replyToMessage` | `GMAIL_ACCESS_TOKEN`, `GMAIL_PRIMARY_EMAIL` | In the [OAuth 2.0 Playground](https://developers.google.com/oauthplayground), authorize `https://www.googleapis.com/auth/gmail.readonly` and `https://www.googleapis.com/auth/gmail.send`, then exchange the code for an access token. Set the mailbox address too. Tokens last about an hour. |
-| YouTube | `searchVideos`, `getVideo`, `getChannel`, `listPlaylistItems`; `addPlaylistItem` | `YOUTUBE_ACCESS_TOKEN`, `YOUTUBE_AUTH_METHOD` | In the OAuth 2.0 Playground, authorize `https://www.googleapis.com/auth/youtube.readonly`. For `addPlaylistItem`, authorize `https://www.googleapis.com/auth/youtube` and set `YOUTUBE_AUTH_METHOD=google-oauth-manage`. |
+| YouTube | `searchVideos`, `getVideo`, `getChannel`, `listPlaylistItems` | `YOUTUBE_ACCESS_TOKEN` | In the OAuth 2.0 Playground, authorize `https://www.googleapis.com/auth/youtube.readonly`. `addPlaylistItem` is not offered: after an insert that took effect but returned a malformed answer, the connector asks for a retry and checks only a playlist listing that can lag, so a retried Step can insert the video twice. |
 | Reddit | `getPost` | `REDDIT_ACCESS_TOKEN`, `REDDIT_CLIENT_ID`, `REDDIT_USERNAME` | Create a script app at <https://www.reddit.com/prefs/apps> and get a token with the `read` scope from `https://www.reddit.com/api/v1/access_token` ([OAuth2 guide](https://github.com/reddit-archive/reddit/wiki/OAuth2)). The client ID and username build the required User-Agent. |
 | Spotify | `listPlaylistTracks` | `SPOTIFY_ACCESS_TOKEN` | Create an app in the [Spotify developer dashboard](https://developer.spotify.com/dashboard) and get a user token with the `playlist-read-private` scope through the [authorization code flow](https://developer.spotify.com/documentation/web-api/tutorials/code-flow). |
 
@@ -144,9 +145,21 @@ uv run ruff check src tests
 They cover an inline query, a query failure branch, a mutation that waits for
 approval and runs once with the expected `CallID`, a connector retry that
 reruns the Step with the same `CallID`, a rejection, a provider rejection, and
-an uncertain outcome. One more test runs the real Slack client against a
-scripted HTTP transport: its first post gets a 503, and the retried Step posts
-again only because the fence's checkpoint from the first attempt allows it.
+an uncertain outcome. They also cover an inline query that retries in place,
+one that runs out of retries, a mutation that writes and then returns an
+invalid receipt (reported as an unknown outcome), and output truncation. One
+more test runs the real Slack client against a scripted HTTP transport: its
+first post gets a 503, and the retried Step posts again only because the
+fence's checkpoint from the first attempt allows it.
+
+Known gaps:
+
+- No test runs a Gmail write or any YouTube, Reddit, or Spotify operation, mocked
+  or live.
+- No test runs several sessions at once.
+- The scripted model always answers after one tool result, so the tests show
+  the text the model receives for an unknown outcome, not that a real model
+  refrains from calling the tool again.
 
 ## Notes and limits
 

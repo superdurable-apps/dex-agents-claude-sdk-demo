@@ -23,6 +23,7 @@ from dex_agents import AgentInterrupt, AgentSessionClient, AgentSessionFlow, Age
 from dex_agents.testing import EXECUTE_COMPLETED_EVENT, AgentTestStack, wait_for_agent_snapshot
 
 from tests.scripted_agent import (
+    BROKEN_WRITES_LOG_NAME,
     SLACK_POSTS_LOG_NAME,
     STATE_DIR_ENVIRONMENT_VARIABLE,
     build_scripted_agent_flow,
@@ -92,6 +93,11 @@ class AgentHarness:
         """Return the client_msg_id of every chat.postMessage the Slack client sent."""
         posts_log = self.state_dir / SLACK_POSTS_LOG_NAME
         return posts_log.read_text().split() if posts_log.exists() else []
+
+    def broken_slack_writes(self) -> list[str]:
+        """Return the Call ID of every write the foreign-receipt Mutation made."""
+        writes_log = self.state_dir / BROKEN_WRITES_LOG_NAME
+        return writes_log.read_text().split() if writes_log.exists() else []
 
     async def executed_steps(self, session_id: str) -> list[tuple[str, int]]:
         history = await self.stack.read_step_history(session_id)
