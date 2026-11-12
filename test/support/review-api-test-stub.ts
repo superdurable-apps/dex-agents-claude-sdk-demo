@@ -4,7 +4,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 
-import type { Account, AccountStatus } from "../../src/review-api/review-api-client.js";
+import type { Account, AccountStatus } from "../../src/review-api.js";
 
 /** One decision request the stub received. */
 export interface RecordedDecision {

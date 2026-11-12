@@ -1,20 +1,15 @@
-// The review scenarios with the pi harness: Dex's built-in agent loop with a scripted model client.
+// The review scenarios with the pi harness, on Dex's built-in agent loop with a scripted model client.
 
 import { ScriptedModelClient } from "@superdurable/dex-agents/testing";
 
-import { createPiSignupAgentFlow } from "../src/agent/pi-signup-agent.js";
-import { AgentHarness } from "../src/signup-review/signup-review-values.js";
-import { decideSignupReply } from "./support/signup-agent-script.js";
+import { createPiSignupAgent } from "../src/pi-agent.js";
+import { decideNextStep } from "./support/scripted-signup-agent.js";
 import { registerSignupReviewScenarios } from "./support/signup-review-scenarios.js";
 
 const scriptedModel = new ScriptedModelClient((request) => {
-  const toolNames = ScriptedModelClient.toolResults(request).map((result) => result.toolName);
-  const reply = decideSignupReply(ScriptedModelClient.userTexts(request), toolNames);
-  return reply.kind === "answer" ? { text: reply.text } : { toolCalls: [{ toolName: reply.toolName, arguments: reply.arguments }] };
+  const seen = ScriptedModelClient.toolResults(request).map((result) => ({ name: result.toolName, output: result.output }));
+  const step = decideNextStep(ScriptedModelClient.userTexts(request).at(-1) ?? "", seen);
+  return step.kind === "answer" ? { text: step.text } : { toolCalls: [{ toolName: step.name, arguments: step.arguments }] };
 });
 
-registerSignupReviewScenarios({
-  harnessName: "pi",
-  harness: AgentHarness.pi,
-  createAgentFlow: (tools) => createPiSignupAgentFlow(tools, scriptedModel),
-});
+registerSignupReviewScenarios({ harnessName: "pi", createFlow: (services) => createPiSignupAgent(services, scriptedModel) });

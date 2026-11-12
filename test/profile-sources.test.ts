@@ -1,10 +1,9 @@
-// The fetch guard refuses private targets before any connection; reviewer replies parse into commands.
+// fetch_profile refuses private targets before any connection, and keeps only visible text.
 
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { checkProfileUrl, fetchPublicPage, htmlToText, isPublicAddress, ProfileSourceError } from "../src/agent/profile-sources.js";
-import { parseReviewCommand } from "../src/signup-review/slack-review-text.js";
+import { checkProfileUrl, fetchPublicPage, htmlToText, isPublicAddress, ProfileSourceError } from "../src/profile-sources.js";
 
 test("fetch_profile refuses non-HTTPS, credentials, other ports and private or local targets", async () => {
   for (const url of [
@@ -38,16 +37,4 @@ test("public addresses are told from private ones", () => {
 test("HTML becomes visible text without scripts and styles", () => {
   const text = htmlToText("<html><head><style>p{}</style><script>alert(1)</script></head><body><h1>Ada</h1><p>Builds &amp; ships</p></body></html>");
   assert.equal(text, "Ada\nBuilds & ships");
-});
-
-test("reviewer replies parse into commands", () => {
-  assert.deepEqual(parseReviewCommand(" Approve. "), { kind: "approve" });
-  assert.deepEqual(parseReviewCommand("send"), { kind: "send" });
-  assert.deepEqual(parseReviewCommand("reject: spam account"), { kind: "reject", reason: "spam account" });
-  assert.deepEqual(parseReviewCommand("reject"), { kind: "reject", reason: "no reason given" });
-  assert.deepEqual(parseReviewCommand("rejection letters are cold, make it warmer"), {
-    kind: "feedback",
-    text: "rejection letters are cold, make it warmer",
-  });
-  assert.equal(parseReviewCommand("   "), undefined);
 });
