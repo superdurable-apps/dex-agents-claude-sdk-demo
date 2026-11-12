@@ -20,6 +20,9 @@ export const ReviewApiErrorCode = {
   notFound: "not_found",
   revisionConflict: "revision_conflict",
   failedPrecondition: "failed_precondition",
+  resourceExhausted: "resource_exhausted",
+  unavailable: "unavailable",
+  internal: "internal",
 } as const;
 export type ReviewApiErrorCode = (typeof ReviewApiErrorCode)[keyof typeof ReviewApiErrorCode];
 

@@ -133,7 +133,19 @@ connector mocks, and a test-only ReviewAPI stub. No model, Slack, Gmail or GitHu
 
 Scenarios: a review with one revision, approval and the email; a request to approve that no reviewer
 wrote, and a send before `send`, both refused; a bystander's reply ignored and each reply relayed
-once; a rejection; an account decided in Dex Cloud admin.
+once; a send whose outcome is unknown, never repeated; a rejection; an account decided in Dex Cloud
+admin.
+
+## Limits
+
+- Thread reads (in the guards and the relay) run the Slack connector's `listThreadMessages` outside a
+  Dex Step. That works with the tokens Dex Web stores; keep Slack token rotation off until refreshing
+  a token outside a Step is supported.
+- A second `post_review` is refused rather than turned into a thread reply; the agent uses
+  `reply_in_thread`.
+- If an uncertain review post cannot be confirmed, the agent may post the review a second time
+  (Slack offers no way to look a message up without its thread).
+- Every review finishes within 7 days, or the relay stops it.
 
 ## License
 

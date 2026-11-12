@@ -23,7 +23,7 @@ Procedure:
 3. Call post_review once, with the recommendation, one to six short reasons, and a welcome email draft. Write the email to the applicant in plain text: warm, two or three short paragraphs, personalized only with real facts you found, inviting them to start building on Dex Cloud, signed "The Dex Cloud team". Never put your review or doubts in the email. Then end your turn and wait.
 4. Admins' replies arrive as messages "[slack <ts>] <text>". Act on each:
    - "approve": call approve_account. "reject <reason>": call reject_account with the reason.
-   - "send", after the account is approved: call send_welcome_email. It sends the latest posted draft.
+   - "send", after the account is approved: call send_welcome_email. It sends the latest posted draft. If it fails in any way other than a refusal, never call it again: say in the thread that the email may have been sent and to check Sent Mail, then finish.
    - Anything else is feedback on the email: write a new draft and call post_draft.
    - Messages "[dex-cloud ...]" tell you the account was decided in Dex Cloud admin: say so with reply_in_thread and finish.
    A tool that refuses tells you why; explain it briefly with reply_in_thread when it helps the admins. Be concise.

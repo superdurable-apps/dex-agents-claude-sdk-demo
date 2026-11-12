@@ -13,7 +13,7 @@ import { Client, Registry, Worker, openBlobCache, type BlobCache } from "@superd
 import { readAgentSnapshot, sendAgentUserMessage } from "@superdurable/dex-agents";
 import { PrivateDexEngine, pollUntil } from "@superdurable/dex-agents/testing";
 
-import { dex, reviewSessionId, type ReviewSessionFlow } from "../../src/review-state.js";
+import { dex, readReviewState, reviewSessionId, type ReviewSessionFlow } from "../../src/review-state.js";
 import { ReviewApiClient } from "../../src/review-api.js";
 import type { SignupServices } from "../../src/signup-agent.js";
 import { relaySlackReplies, startPendingReviews } from "../../src/signup-loops.js";
@@ -252,6 +252,22 @@ export function registerSignupReviewScenarios(setup: SignupReviewScenarioSetup):
     await waitForStop(sessionId);
   });
 
+  test(`${setup.harnessName}: an email send whose outcome is unknown is never repeated`, async () => {
+    const { sessionId, thread } = await startReview("unconfirmed", 1710000400);
+    thread.scriptBotReply();
+    await relayAndWait(sessionId, thread.reply(reviewerId, "approve"));
+    gmail
+      .sendMessage()
+      .forFlow(sessionId)
+      .respond(sendMessageBranch("defect", { sender: "", recipients: [], messageId: "", threadId: "" }, { kind: "TRANSPORT", provider: "google", operation: "sendMessage", message: "connection reset" }));
+    await relayAndWait(sessionId, thread.reply(reviewerId, "send"));
+    assert.equal(gmail.sendMessage().calls().filter((call) => call.flowId === sessionId).length, 1);
+    assert.match(threadReplies(sessionId).at(-1)?.input.text ?? "", /check Sent Mail/);
+    // The guard counts the unconfirmed call as an attempt, so no later call can send again.
+    assert.equal((await readReviewState(sessionId)).hasSendAttempt, true);
+    await waitForStop(sessionId);
+  });
+
   test(`${setup.harnessName}: a rejected sign-up is rejected and gets no email`, async () => {
     const { accountId, sessionId, thread, post } = await startReview(rejectedApplicantWord, 1710000200);
     assert.match(post.text, /:x: Reject/);
@@ -269,10 +285,15 @@ export function registerSignupReviewScenarios(setup: SignupReviewScenarioSetup):
     const { accountId, sessionId } = await startReview("elsewhere", 1710000300);
     reviewApi.decideElsewhere(accountId, "active");
     // The relay reads the account every fourth round.
-    for (let index = 0; index < 4; index++) {
-      await relay();
-    }
-    await waitForIdle(sessionId);
+    const turns = await turnsOf(sessionId);
+    await pollUntil(
+      async () => {
+        await relay();
+        return (await userTexts(sessionId)).some((text) => text.startsWith("[dex-cloud active]")) ? true : undefined;
+      },
+      { description: "the relay reports the decision", ...waitOptions },
+    );
+    await waitForIdle(sessionId, turns);
     assert.equal((await userTexts(sessionId)).filter((text) => text.startsWith("[dex-cloud active]")).length, 1);
     assert.match(threadReplies(sessionId).at(-1)?.input.text ?? "", /Decided in Dex Cloud admin/);
     assert.equal(reviewApi.decisions.filter((decision) => decision.accountId === accountId).length, 0);

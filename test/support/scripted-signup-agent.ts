@@ -48,8 +48,13 @@ export function decideNextStep(userText: string, seen: readonly SeenResult[]): S
     return follow([tool("reject_account", { reason: reply.slice(6).trim() }), tool("reply_in_thread", { text: "Rejected." }), tool("finish_review")], seen);
   }
   if (reply === "send" || reply === "send now") {
-    const isSent = seen[0] !== undefined && seen[0].output.includes("messageId");
-    return follow([tool("send_welcome_email"), ...(isSent ? [tool("reply_in_thread", { text: "Sent." }), tool("finish_review")] : [])], seen);
+    const result = seen[0]?.output ?? "";
+    const after = result.includes("messageId")
+      ? [tool("reply_in_thread", { text: "Sent." }), tool("finish_review")]
+      : result.includes("refused:")
+        ? []
+        : [tool("reply_in_thread", { text: "The email may have been sent; check Sent Mail." }), tool("finish_review")];
+    return follow([tool("send_welcome_email"), ...after], seen);
   }
   if (userText.startsWith("[dex-cloud")) {
     return follow([tool("reply_in_thread", { text: "Decided in Dex Cloud admin; nothing more to do." }), tool("finish_review")], seen);
