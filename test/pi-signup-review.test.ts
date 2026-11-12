@@ -8,7 +8,7 @@ import { registerSignupReviewScenarios } from "./support/signup-review-scenarios
 
 const scriptedModel = new ScriptedModelClient((request) => {
   const seen = ScriptedModelClient.toolResults(request).map((result) => ({ name: result.toolName, output: result.output }));
-  const step = decideNextStep(ScriptedModelClient.userTexts(request).at(-1) ?? "", seen);
+  const step = decideNextStep(ScriptedModelClient.userTexts(request), seen);
   return step.kind === "answer" ? { text: step.text } : { toolCalls: [{ toolName: step.name, arguments: step.arguments }] };
 });
 

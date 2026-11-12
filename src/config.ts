@@ -17,6 +17,14 @@ export interface SignupAgentConfig {
   readonly claudeModel: string;
   readonly githubToken: string | undefined;
   readonly watchIntervalMs: number;
+  readonly threadPollIntervalMs: number;
+}
+
+function positiveInteger(value: string, name: string): number {
+  if (!/^[1-9]\d{0,5}$/.test(value)) {
+    throw new Error(`${name} must be a positive whole number of seconds`);
+  }
+  return Number(value);
 }
 
 export function loadSignupAgentConfig(environment: NodeJS.ProcessEnv = process.env): SignupAgentConfig {
@@ -42,6 +50,7 @@ export function loadSignupAgentConfig(environment: NodeJS.ProcessEnv = process.e
     piModel: optional("SIGNUP_AGENT_PI_MODEL") ?? "anthropic/claude-opus-5-5",
     claudeModel: optional("SIGNUP_AGENT_CLAUDE_MODEL") ?? "claude-opus-5-5",
     githubToken: optional("GITHUB_TOKEN"),
-    watchIntervalMs: Number(optional("SIGNUP_WATCH_INTERVAL_SECONDS") ?? "30") * 1_000,
+    watchIntervalMs: positiveInteger(optional("SIGNUP_WATCH_INTERVAL_SECONDS") ?? "30", "SIGNUP_WATCH_INTERVAL_SECONDS") * 1_000,
+    threadPollIntervalMs: positiveInteger(optional("SIGNUP_THREAD_POLL_SECONDS") ?? "15", "SIGNUP_THREAD_POLL_SECONDS") * 1_000,
   };
 }

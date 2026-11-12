@@ -4,7 +4,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 
-import type { Account, AccountStatus } from "../../src/review-api.js";
+import type { Account } from "../../src/review-api.js";
 
 /** One decision request the stub received. */
 export interface RecordedDecision {
@@ -25,6 +25,8 @@ export class ReviewApiTestStub {
   public readonly decisions: RecordedDecision[] = [];
   public readonly apiKey = "srk_test_not-a-real-secret";
   private readonly accounts = new Map<string, StoredAccount>();
+  /** Operations whose next call is applied but answered with a 503, as a lost response would look. */
+  private readonly failAfterApplying = new Set<string>();
 
   private constructor(private readonly server: Server) {}
 
@@ -55,9 +57,14 @@ export class ReviewApiTestStub {
   }
 
   /** Decides an account as an administrator on the Dex Cloud Users page would, which moves its revision. */
-  public decideElsewhere(accountId: string, status: AccountStatus): void {
+  public decideElsewhere(accountId: string, status: Account["status"]): void {
     const stored = this.accounts.get(accountId)!;
     stored.account = { ...stored.account, status, revision: Number(stored.account.revision) + 1 };
+  }
+
+  /** Applies the next `operation` call, then answers 503 instead of the result. */
+  public failNextResponse(operation: "approve" | "reject"): void {
+    this.failAfterApplying.add(operation);
   }
 
   public accountOf(accountId: string): Account | undefined {
@@ -116,6 +123,10 @@ export class ReviewApiTestStub {
       revision: Number(stored.account.revision) + 1,
     };
     stored.appliedRequests.set(decision.requestId, stored.account);
+    if (this.failAfterApplying.delete(operation)) {
+      send(response, 503, { error: { code: "unavailable", message: "lost answer" } });
+      return;
+    }
     send(response, 200, { account: stored.account });
   }
 }

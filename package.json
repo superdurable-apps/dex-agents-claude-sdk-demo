@@ -9,10 +9,10 @@
     "node": "^22.19.0 || ^24.0.0"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "rm -rf dist && tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "start": "npm run build && node --env-file-if-exists=.env dist/src/main.js",
-    "test": "npm run build && node --test --experimental-test-isolation=none --test-force-exit --test-concurrency=1 'dist/test/**/*.test.js'"
+    "test": "npm run build && node --test --test-force-exit --test-concurrency=1 'dist/test/**/*.test.js'"
   },
   "dependencies": {
     "@earendil-works/pi-agent-core": "1.5.1",

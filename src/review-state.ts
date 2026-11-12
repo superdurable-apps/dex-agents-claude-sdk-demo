@@ -1,27 +1,29 @@
-// What a review session has done so far, read from its own Dex state, and the Slack thread it posted.
-// The tools' guards and the Slack reply relay decide from these facts, never from what the model says.
+// What a review session has done so far, read from its own Dex state: the facts every guard decides from.
+// Reviewer replies are the `[slack <ts>] <@user>: text` user messages that the thread-watch Flow sends; tool output
+// is never a user message, so nothing a tool returns can pass for a reviewer.
 
-import { createCall, runQuery } from "@superdurable/connectors-sdk";
-import type { Connection as SlackConnection, Message as SlackMessage } from "@superdurable/connector-slack";
-import type { AsyncContext, Client } from "@superdurable/dex";
+import type { Client } from "@superdurable/dex";
 import {
   readAgentSnapshot,
+  sendAgentUserMessage,
+  toolCallNotRunErrorPrefix,
   type AgentFrameworkRunner,
   type AgentMessage,
   type AgentSessionFlow,
   type AgentSnapshot,
   type DeferredToolOutcome,
 } from "@superdurable/dex-agents";
+import { connectorNotSentRetryLater } from "@superdurable/dex-agents/connectors";
 
 /** An agent session Flow of either harness. */
 export type ReviewSessionFlow = AgentSessionFlow<AgentFrameworkRunner<DeferredToolOutcome>>;
 
-/** The session ID, which is the FlowID, of the review of one account. */
 export const reviewSessionId = (accountId: string): string => `signup-review-${accountId}`;
 export const accountIdOf = (sessionId: string): string => sessionId.replace(/^signup-review-/, "");
 
-/** The Dex Client and the session Flow, set once the process has built them. */
-export const dex: { client?: Client; flow?: ReviewSessionFlow } = {};
+/** Prefixes of the tools' own failures that prove nothing was sent. */
+export const refusedPrefix = "refused: ";
+export const notSentPrefix = "not sent: ";
 
 export interface Draft {
   readonly subject: string;
@@ -30,13 +32,27 @@ export interface Draft {
   readonly ts: string;
 }
 
+export interface ReviewerReply {
+  readonly ts: string;
+  readonly userId: string;
+  readonly text: string;
+}
+
 /** The facts of one review session. */
 export interface ReviewState {
   readonly snapshot: AgentSnapshot;
-  /** The review's Slack thread, once post_review succeeded. */
-  readonly thread?: { readonly channel: string; readonly ts: string };
-  /** Every posted draft, oldest first; the first is the one in the review post. */
-  readonly drafts: readonly Draft[];
+  /** The review's Slack thread, once post_review succeeded, and the bot user that posted it. */
+  readonly thread?: { readonly channel: string; readonly ts: string; readonly botUserId: string | undefined };
+  /** The newest draft whose post succeeded; draft 1 is in the review post. */
+  readonly latestDraft?: Draft;
+  /** Drafts whose post may have gone out: the review post and every post_draft that got past its guard. */
+  readonly draftAttempts: number;
+  /** Whether a post_draft newer than the latest draft may have been posted without a confirmation. */
+  readonly hasUnconfirmedNewerDraft: boolean;
+  /** The reviewers' replies relayed so far, oldest first. */
+  readonly replies: readonly ReviewerReply[];
+  /** The latest reply that is a decision: exactly `approve`, or `reject <reason>`. */
+  readonly decision?: "approve" | "reject";
   readonly isApprovedHere: boolean;
   readonly isRejectedHere: boolean;
   /** Whether send_welcome_email ever got past its guard, whatever its outcome: it never runs twice. */
@@ -44,17 +60,14 @@ export interface ReviewState {
   readonly isFinished: boolean;
 }
 
-/** One tool call of the session: its arguments, its output when it succeeded, and whether it has a result yet. */
+type Outcome = "running" | "succeeded" | "refused" | "unknown";
+
 interface ToolCallFact {
-  readonly id: string;
   readonly name: string;
   readonly arguments: Record<string, unknown>;
   readonly output: Record<string, unknown> | undefined;
-  /** The result text, success or failure; undefined while the call runs. */
-  readonly resultText: string | undefined;
+  readonly outcome: Outcome;
 }
-
-const bareName = (name: string): string => name.split("__").at(-1) ?? name;
 
 function parseObject(text: string | null | undefined): Record<string, unknown> | undefined {
   try {
@@ -65,84 +78,153 @@ function parseObject(text: string | null | undefined): Record<string, unknown> |
   }
 }
 
-/**
- * Every tool call, from the stored messages of finished turns and the active turn's call records. A failed call's
- * output is error text, so its parsed output is undefined; a call still running has no result.
- */
+/** A finished call's outcome from its result text: our refusals and the SDK's not-run notes prove nothing ran. */
+function outcomeOf(name: string, resultText: string, isSuccess: boolean): Outcome {
+  if (isSuccess) {
+    return "succeeded";
+  }
+  const detail = resultText.replace(/^The tool call failed: /, "");
+  const isNotRun =
+    detail.startsWith(refusedPrefix) ||
+    detail.startsWith(notSentPrefix) ||
+    detail.startsWith(toolCallNotRunErrorPrefix) ||
+    (name === "send_welcome_email" && detail.startsWith(`gmail sendMessage ${connectorNotSentRetryLater}`)) ||
+    detail.startsWith(`slack postThreadReply ${connectorNotSentRetryLater}`) ||
+    detail.startsWith(`slack postChannelMessage ${connectorNotSentRetryLater}`);
+  return isNotRun ? "refused" : "unknown";
+}
+
+/** Every tool call: from the stored messages of finished turns, then the active turn's call records. */
 function toolCallsOf(messages: readonly AgentMessage[], snapshot: AgentSnapshot): ToolCallFact[] {
+  const bareName = (name: string) => name.split("__").at(-1) ?? name;
   const results = new Map(messages.filter((message) => message.role === "tool").map((message) => [message.toolCallId, message.toolOutput]));
   const facts = new Map<string, ToolCallFact>();
   for (const message of messages) {
     if (message.role === "assistant" && message.toolName !== null && message.toolCallId !== null) {
+      const resultText = results.get(message.toolCallId);
+      const output = parseObject(resultText);
       facts.set(message.toolCallId, {
-        id: message.toolCallId,
         name: bareName(message.toolName),
         arguments: parseObject(message.toolArguments) ?? {},
-        output: parseObject(results.get(message.toolCallId)),
-        resultText: results.get(message.toolCallId) ?? undefined,
+        output,
+        outcome: resultText === undefined || resultText === null ? "running" : outcomeOf(bareName(message.toolName), resultText, output !== undefined),
       });
     }
   }
   for (const record of snapshot.toolCalls) {
-    const isFinal = ["succeeded", "failed", "rejected", "outcome_unknown"].includes(record.status);
-    facts.set(record.toolCallId, {
-      id: record.toolCallId,
-      name: bareName(record.toolName),
-      arguments: parseObject(record.arguments) ?? {},
-      output: record.status === "succeeded" ? parseObject(record.output) : undefined,
-      resultText: isFinal ? (record.output ?? record.error ?? record.rejectionMessage ?? record.status) : facts.get(record.toolCallId)?.resultText,
-    });
+    const name = bareName(record.toolName);
+    const output = record.status === "succeeded" ? parseObject(record.output) : undefined;
+    const outcome: Outcome =
+      record.status === "succeeded"
+        ? "succeeded"
+        : record.status === "failed" || record.status === "rejected"
+          ? outcomeOf(name, record.error ?? record.rejectionMessage ?? "", false)
+          : record.status === "outcome_unknown"
+            ? "unknown"
+            : "running";
+    facts.set(record.toolCallId, { name, arguments: parseObject(record.arguments) ?? {}, output, outcome });
   }
   return [...facts.values()];
 }
 
-/** All of the session's messages; the snapshot holds the newest 200, older ones are paged in. */
-async function allMessages(client: Client, flow: ReviewSessionFlow, sessionId: string, snapshot: AgentSnapshot): Promise<AgentMessage[]> {
-  let messages = [...snapshot.messages];
-  for (let page = 0; page < 20 && (messages[0]?.sequence ?? 1) > 1; page++) {
-    const older = await client.invokeRPC(flow.listAgentMessages, sessionId, { beforeSequence: messages[0]!.sequence, limit: 200 });
-    if (older.messages.length === 0) {
-      break;
+const replyPattern = /^\[slack (\d+\.\d+)\] <@([A-Z0-9]+)>: ([\s\S]*)$/;
+
+/** Reads review sessions and sends them messages. Connect it once the Client and the session Flow exist. */
+export class ReviewSessions {
+  private client: Client | undefined;
+  private flow: ReviewSessionFlow | undefined;
+
+  public constructor(private readonly reviewerIds: ReadonlySet<string>) {}
+
+  public connect(client: Client, flow: ReviewSessionFlow): void {
+    this.client = client;
+    this.flow = flow;
+  }
+
+  private get dex(): { client: Client; flow: ReviewSessionFlow } {
+    if (this.client === undefined || this.flow === undefined) {
+      throw new Error("ReviewSessions is not connected yet");
     }
-    messages = [...older.messages, ...messages];
+    return { client: this.client, flow: this.flow };
   }
-  return messages;
-}
 
-/** Reads what the session has done: its thread, its drafts, and its decisions. */
-export async function readReviewState(sessionId: string): Promise<ReviewState> {
-  const { client, flow } = dex as Required<typeof dex>;
-  const snapshot = await readAgentSnapshot(client, flow, sessionId);
-  const calls = toolCallsOf(await allMessages(client, flow, sessionId, snapshot), snapshot);
-  const succeeded = (name: string) => calls.filter((call) => call.name === name && call.output !== undefined);
-  const review = succeeded("post_review")[0];
-  const reviewMessage = review?.output?.message as { channelId?: string; timestamp?: string } | undefined;
-  const drafts: Draft[] = [];
-  if (review !== undefined && reviewMessage?.timestamp) {
-    drafts.push({ subject: String(review.arguments.emailSubject), body: String(review.arguments.emailBody), ts: reviewMessage.timestamp });
+  /** Sends `<marker> <text>` unless the session already holds or queues a message that starts with `marker`. */
+  public async sendOnce(sessionId: string, marker: string, text: string): Promise<void> {
+    const { client, flow } = this.dex;
+    const snapshot = await readAgentSnapshot(client, flow, sessionId);
+    const messages = await this.allMessages(sessionId, snapshot);
+    const isThere =
+      messages.some((message) => message.role === "user" && (message.text ?? "").startsWith(marker)) ||
+      (snapshot.queuedMessages ?? []).some((pending) => pending.message.text.startsWith(marker));
+    if (!isThere) {
+      await sendAgentUserMessage(client, flow, sessionId, { text: `${marker} ${text}` });
+    }
   }
-  for (const call of succeeded("post_draft")) {
-    const message = call.output?.message as { timestamp?: string } | undefined;
-    drafts.push({ subject: String(call.arguments.subject), body: String(call.arguments.body), ts: message?.timestamp ?? "" });
-  }
-  return {
-    snapshot,
-    ...(reviewMessage?.timestamp ? { thread: { channel: String(reviewMessage.channelId), ts: reviewMessage.timestamp } } : {}),
-    drafts,
-    isApprovedHere: succeeded("approve_account").some((call) => call.output?.status === "approved"),
-    isRejectedHere: succeeded("reject_account").some((call) => call.output?.status === "rejected"),
-    // A refusal (the guard, or the connector proving nothing was sent) is no attempt; anything else may have sent.
-    hasSendAttempt: calls.some((call) => call.name === "send_welcome_email" && call.resultText !== undefined && !/refused:|not sent/.test(call.resultText)),
-    isFinished: succeeded("finish_review").length > 0,
-  };
-}
 
-/** Whether the session holds or queues a user message that starts with `marker`. */
-export function hasUserMessage(snapshot: AgentSnapshot, marker: string): boolean {
-  return (
-    snapshot.messages.some((message) => message.role === "user" && (message.text ?? "").startsWith(marker)) ||
-    (snapshot.queuedMessages ?? []).some((pending) => pending.message.text.startsWith(marker))
-  );
+  public async read(sessionId: string): Promise<ReviewState> {
+    const snapshot = await readAgentSnapshot(this.dex.client, this.dex.flow, sessionId);
+    const messages = await this.allMessages(sessionId, snapshot);
+    const calls = toolCallsOf(messages, snapshot);
+    const succeeded = (name: string) => calls.filter((call) => call.name === name && call.outcome === "succeeded");
+
+    const review = succeeded("post_review")[0];
+    const reviewMessage = review?.output?.message as { channelId?: string; timestamp?: string; userId?: string } | undefined;
+    let latestDraft: Draft | undefined;
+    let draftAttempts = review === undefined ? 0 : 1;
+    let hasUnconfirmedNewerDraft = false;
+    if (review !== undefined && reviewMessage?.timestamp) {
+      latestDraft = { subject: String(review.arguments.emailSubject), body: String(review.arguments.emailBody), ts: reviewMessage.timestamp };
+    }
+    for (const call of calls.filter((candidate) => candidate.name === "post_draft")) {
+      if (call.outcome === "succeeded") {
+        const ts = String((call.output?.message as { timestamp?: string } | undefined)?.timestamp ?? "");
+        latestDraft = { subject: String(call.arguments.subject), body: String(call.arguments.body), ts };
+        hasUnconfirmedNewerDraft = false;
+      } else if (call.outcome === "unknown") {
+        hasUnconfirmedNewerDraft = true;
+      }
+      draftAttempts += call.outcome === "succeeded" || call.outcome === "unknown" ? 1 : 0;
+    }
+
+    const replies: ReviewerReply[] = [];
+    for (const message of messages) {
+      const match = message.role === "user" && message.origin === undefined ? replyPattern.exec(message.text ?? "") : null;
+      if (match !== null && this.reviewerIds.has(match[2]!) && match[2] !== reviewMessage?.userId) {
+        replies.push({ ts: match[1]!, userId: match[2]!, text: match[3]!.trim() });
+      }
+    }
+    let decision: "approve" | "reject" | undefined;
+    for (const reply of replies) {
+      decision = /^approve$/i.test(reply.text) ? "approve" : /^reject\s+\S/i.test(reply.text) ? "reject" : decision;
+    }
+    return {
+      snapshot,
+      ...(reviewMessage?.timestamp ? { thread: { channel: String(reviewMessage.channelId), ts: reviewMessage.timestamp, botUserId: reviewMessage.userId } } : {}),
+      ...(latestDraft === undefined ? {} : { latestDraft }),
+      draftAttempts,
+      hasUnconfirmedNewerDraft,
+      replies,
+      ...(decision === undefined ? {} : { decision }),
+      isApprovedHere: succeeded("approve_account").some((call) => call.output?.status === "approved"),
+      isRejectedHere: succeeded("reject_account").some((call) => call.output?.status === "rejected"),
+      hasSendAttempt: calls.some((call) => call.name === "send_welcome_email" && (call.outcome === "succeeded" || call.outcome === "unknown")),
+      isFinished: succeeded("finish_review").length > 0,
+    };
+  }
+
+  /** All of the session's messages: the snapshot holds the newest 200, and older pages are read back. */
+  private async allMessages(sessionId: string, snapshot: AgentSnapshot): Promise<AgentMessage[]> {
+    const { client, flow } = this.dex;
+    let messages = [...snapshot.messages];
+    for (let page = 0; page < 50 && (messages[0]?.sequence ?? 1) > 1; page++) {
+      const older = await client.invokeRPC(flow.listAgentMessages, sessionId, { beforeSequence: messages[0]!.sequence, limit: 200 });
+      if (older.messages.length === 0) {
+        break;
+      }
+      messages = [...older.messages, ...messages];
+    }
+    return messages;
+  }
 }
 
 /** Whether Slack timestamp `ts` is later than `other`, compared exactly (`<seconds>.<microseconds>`). */
@@ -152,39 +234,4 @@ export function isLater(ts: string, other: string): boolean {
     return BigInt(seconds) * 1_000_000n + BigInt((fraction + "000000").slice(0, 6));
   };
   return exact(ts) > exact(other);
-}
-
-/**
- * The reviewers' replies in a thread, oldest first: messages after the root post from members in `reviewerIds`.
- * Thread reads run outside any Dex Step (in a tool or in the relay); a query has no fence, so a fixed call identity
- * per session is enough.
- */
-export async function readReviewerReplies(
-  slack: SlackConnection,
-  sessionId: string,
-  thread: { readonly channel: string; readonly ts: string },
-  reviewerIds: ReadonlySet<string>,
-  signal: AbortSignal,
-): Promise<SlackMessage[]> {
-  const operation = slack.operations.listThreadMessages();
-  const context = { flowId: sessionId, runId: "", stepExecutionId: "read-review-thread", attempt: 1, cancellationSignal: signal, deadline: undefined };
-  const call = createCall(context as unknown as AsyncContext, slack.reference, operation.definition().operation);
-  const replies: SlackMessage[] = [];
-  let cursor: string | undefined;
-  for (let page = 0; page < 20; page++) {
-    const result = await runQuery(operation, call, { channelId: thread.channel, threadTimestamp: thread.ts, pageSize: 15, ...(cursor ? { cursor } : {}) });
-    if (result.branch !== "read") {
-      throw new Error(`reading the Slack thread ended ${result.branch}: ${result.failure?.message ?? ""}`);
-    }
-    for (const message of result.value.messages ?? []) {
-      if (isLater(message.timestamp, thread.ts) && message.userId !== undefined && reviewerIds.has(message.userId)) {
-        replies.push(message);
-      }
-    }
-    cursor = result.value.nextCursor;
-    if (!cursor) {
-      break;
-    }
-  }
-  return replies;
 }
