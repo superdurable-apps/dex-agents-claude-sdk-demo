@@ -1,0 +1,36 @@
+{
+  "name": "dex-signup-agent-demo",
+  "private": true,
+  "version": "0.1.0",
+  "description": "A Dex agent that reviews Dex Cloud sign-ups and asks admins in Slack before it approves an account or sends a welcome email",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": "^22.19.0 || ^24.0.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "start": "npm run build && node --env-file-if-exists=.env dist/src/main.js",
+    "test": "npm run build && node --test --experimental-test-isolation=none --test-force-exit --test-concurrency=1 'dist/test/**/*.test.js'"
+  },
+  "dependencies": {
+    "@earendil-works/pi-agent-core": "1.5.1",
+    "@earendil-works/pi-ai": "1.5.1",
+    "@earendil-works/pi-schema": "1.5.1",
+    "@superdurable/connector-google-gmail": "0.2.0",
+    "@superdurable/connector-slack": "0.4.1",
+    "@superdurable/connectors-sdk": "0.9.0",
+    "@superdurable/dex": "1.45.0",
+    "@superdurable/dex-agents": "0.6.0",
+    "@superdurable/dex-agents-pi": "0.6.0",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0"
+  },
+  "overrides": {
+    "@superdurable/dex": "$@superdurable/dex"
+  }
+}
