@@ -173,17 +173,28 @@ export function createSignupTools(services: SignupServices): SignupTool[] {
 /** What a guard decides: the operation's input and the facts its record carries, or an earlier call's result. */
 type GuardDecision<Input, Output> = { readonly input: Input; readonly describe?: Record<string, unknown> } | { readonly alreadyDone: Output };
 
+/** The small part of a connector result the ledger keeps: ids and timestamps, never texts. */
+function summarize(value: unknown): Record<string, unknown> {
+  const record = (value ?? {}) as Record<string, unknown>;
+  const message = record.message as { channelId?: string; timestamp?: string; userId?: string } | undefined;
+  return message !== undefined
+    ? { message: { channelId: message.channelId, timestamp: message.timestamp, userId: message.userId } }
+    : { messageId: record.messageId, threadId: record.threadId };
+}
+
 /**
  * A connector write whose guard decides from the review's ledger, and whose effect the ledger records: `attempted`
- * before the dispatch (no record, no dispatch), then `succeeded` with the result and the guard's facts, or `not_sent`
- * when the provider refused it. A retried attempt of a recorded call skips the guard and dispatches its recorded input
- * under the connector's own call identity and fence; a call recorded as succeeded answers its recorded result.
+ * before the dispatch (no record, no dispatch), then `succeeded` with a small result and the guard's facts. Only a
+ * Slack post that the provider refused is recorded `not_sent`; a send stays attempted whatever follows, since a
+ * provider error after the dispatch does not prove that no email went out. A call already in the ledger is never
+ * dispatched again.
  */
 function guarded<Input, Output>(
   sessions: ReviewSessions,
   tool: string,
   operation: Mutation<Input, Output>,
   guard: (args: Record<string, unknown>, accountId: string, state: ReviewState, call: Call) => Promise<GuardDecision<Input, Output>>,
+  isRefusalProofOfNotSent: boolean,
 ): Mutation<Record<string, unknown>, Output> {
   return {
     definition: () => operation.definition(),
@@ -191,26 +202,20 @@ function guarded<Input, Output>(
     invoke: async (call, args) => {
       const accountId = accountIdOf(call.context.flowId);
       const callKey = call.idempotencyKey ?? call.id;
-      let input: Input;
-      let describe: Record<string, unknown> | undefined;
+      let decision: GuardDecision<Input, Output>;
       try {
-        const state = await sessions.read(accountId, callKey);
-        const own = state.ownEffect;
-        if (own?.status === "succeeded") {
-          return newMutationBranch("sent", own.result as Output);
+        const state = await sessions.read(accountId);
+        if (state.effects.some((effect) => effect.callKey === callKey)) {
+          refuse("this call was attempted before and its outcome is unknown; it is not dispatched again");
         }
-        if (own?.status === "attempted") {
-          ({ input, describe } = own.payload as { input: Input; describe?: Record<string, unknown> });
-        } else {
-          const decision = await guard(args, accountId, state, call);
-          if ("alreadyDone" in decision) {
-            // An earlier call whose outcome was unknown turned out to have done it: adopt its result.
-            await sessions.record(accountId, { callKey, tool, status: "succeeded", result: decision.alreadyDone as Record<string, unknown> });
-            return newMutationBranch("sent", decision.alreadyDone);
-          }
-          ({ input, describe } = decision);
-          await sessions.record(accountId, { callKey, tool, status: "attempted", payload: { input, describe } });
+        decision = await guard(args, accountId, state, call);
+        if ("alreadyDone" in decision) {
+          // An earlier call whose outcome was unknown turned out to have done it: adopt its result.
+          const done = decision.alreadyDone as Record<string, unknown>;
+          await sessions.record(accountId, { callKey, tool, status: "succeeded", result: { ...summarize(done), draft: done.draft } });
+          return newMutationBranch("sent", decision.alreadyDone);
         }
+        await sessions.record(accountId, { callKey, tool, status: "attempted" });
       } catch (error: unknown) {
         // Nothing was dispatched, so a guard or ledger failure is a definite failure the model reads.
         if (error instanceof MissingLedgerError) {
@@ -218,13 +223,12 @@ function guarded<Input, Output>(
         }
         throw error instanceof ToolExecutionError ? error : new ToolExecutionError(`${notSentPrefix}${error instanceof Error ? error.message.slice(0, 300) : String(error)}`);
       }
-      const attempt = await operation.invoke(call, input);
+      const attempt = await operation.invoke(call, decision.input);
       if (attempt.kind === "branch" && attempt.branch === "sent") {
-        const result = { ...attempt.value, ...describe };
-        await sessions.record(accountId, { callKey, tool, status: "succeeded", result: result as Record<string, unknown> });
-        return { ...attempt, value: result };
+        await sessions.record(accountId, { callKey, tool, status: "succeeded", result: { ...summarize(attempt.value), ...decision.describe } });
+        return { ...attempt, value: { ...attempt.value, ...decision.describe } };
       }
-      if (attempt.kind === "branch" && attempt.branch === "providerRejected") {
+      if (attempt.kind === "branch" && attempt.branch === "providerRejected" && isRefusalProofOfNotSent) {
         await sessions.record(accountId, { callKey, tool, status: "not_sent" });
       }
       return attempt;
@@ -232,28 +236,36 @@ function guarded<Input, Output>(
   };
 }
 
+/** Reads which Slack app this connection posts as; queries run inside the tool Step under its call context. */
+async function slackIdentity(services: SignupServices, call: Call) {
+  const operation = services.slack.operations.getWorkspaceIdentity();
+  const identity = await runQuery(operation, createCall(call.context, services.slack.reference, operation.definition().operation), {});
+  if (identity.branch !== "read") {
+    throw new Error(`reading the Slack app's identity ended ${identity.branch}`);
+  }
+  return identity.value;
+}
+
 /**
  * Looks for the review post that an earlier, unconfirmed post_review may have made: the app's own channel message,
  * since that call, whose last line is the review's footer. Slack may allow one history read per minute, so only this
  * reconciliation reads channel history, and one page of it.
  */
-async function findOwnReviewPost(services: SignupServices, call: Call, footer: string, since: string) {
-  const { slack, slackChannelId } = services;
-  const query = <Input, Output>(operation: Query<Input, Output>, input: Input) =>
-    runQuery(operation, createCall(call.context, slack.reference, operation.definition().operation), input);
-  const identity = await query(slack.operations.getWorkspaceIdentity(), {});
-  if (identity.branch !== "read") {
-    throw new Error(`reading the Slack app's identity ended ${identity.branch}`);
-  }
+async function findOwnReviewPost(services: SignupServices, call: Call, identity: { botId: string; botUserId: string }, footer: string, since: string) {
+  const operation = services.slack.operations.listChannelMessages();
   const oldestTimestamp = `${Math.floor(Date.parse(since) / 1000) - 5}.000000`;
-  const page = await query(slack.operations.listChannelMessages(), { channelId: slackChannelId, oldestTimestamp, pageSize: 15 });
+  const page = await runQuery(operation, createCall(call.context, services.slack.reference, operation.definition().operation), {
+    channelId: services.slackChannelId,
+    oldestTimestamp,
+    pageSize: 15,
+  });
   if (page.branch !== "read") {
     throw new Error(`reading the Slack channel ended ${page.branch}`);
   }
   const found = (page.value.messages ?? []).find(
-    (message) => (message.botId === identity.value.botId || message.userId === identity.value.botUserId) && message.text.split("\n").at(-1) === footer,
+    (message) => ((identity.botId !== "" && message.botId === identity.botId) || (identity.botUserId !== "" && message.userId === identity.botUserId)) && message.text.split("\n").at(-1) === footer,
   );
-  return found === undefined ? undefined : { channelId: found.channelId, timestamp: found.timestamp, userId: identity.value.botUserId, text: found.text };
+  return found === undefined ? undefined : { channelId: found.channelId, timestamp: found.timestamp, userId: identity.botUserId, text: found.text };
 }
 
 /** The last line of a review post, which identifies it. */
@@ -287,28 +299,34 @@ export function createSignupConnectorTools(services: SignupServices): ToolSource
     const account = await services.reviewApi.getAccount(accountId, call.context.cancellationSignal);
     const text = reviewPost(account, review, services.harnessLabel, sessionId);
     const draft = { number: 1, subject: review.emailSubject, body: review.emailBody };
+    const identity = await slackIdentity(services, call);
+    if (sessions.reviewerIds.has(identity.botUserId)) {
+      refuse("SIGNUP_REVIEWER_SLACK_IDS lists the Slack app's own user; remove it, the app must not decide on its own reviews");
+    }
     if (state.unconfirmedReviewPostAt !== undefined) {
-      const message = await findOwnReviewPost(services, call, reviewFooter(services.harnessLabel, sessionId), state.unconfirmedReviewPostAt);
+      const message = await findOwnReviewPost(services, call, identity, reviewFooter(services.harnessLabel, sessionId), state.unconfirmedReviewPostAt);
       if (message !== undefined) {
         // The earlier post shows its own draft: adopt the thread, and the draft only when it is this one.
         return message.text === text
           ? { alreadyDone: { message, draft } }
           : { alreadyDone: { message, draft: null, note: "an earlier attempt posted the review with another draft; post this draft with post_draft" } };
       }
+      // Not found: the review is posted at most once, so it is not posted again.
+      refuse("an earlier review post may have gone out and was not found in the channel; it is not posted again, so decide in Dex Cloud admin");
     }
     return { input: { channelId: services.slackChannelId, text }, describe: { draft } };
-  });
+  }, true);
   const postDraft = guarded(sessions, "post_draft", slack.operations.postThreadReply(), async (args, _accountId, state) => {
     const thread = requireThread(state);
     const draft = draftSchema.parse(args);
     const number = state.draftAttempts + 1;
     const text = `*[draft ${number}]*\n${emailBlock(draft.subject, draft.body)}\nReply \`send\` to send this draft once the account is approved, or write what to change.`;
     return { input: { channelId: thread.channel, threadTimestamp: thread.ts, text }, describe: { draft: { number, ...draft } } };
-  });
+  }, true);
   const replyInThread = guarded(sessions, "reply_in_thread", slack.operations.postThreadReply(), async (args, _accountId, state) => {
     const thread = requireThread(state);
     return { input: { channelId: thread.channel, threadTimestamp: thread.ts, text: escapeSlack(replySchema.parse(args).text) } };
-  });
+  }, true);
   const sendWelcomeEmail = guarded(sessions, "send_welcome_email", gmail.operations.sendMessage(), async (_args, accountId, state, call) => {
     if (state.hasSendAttempt) {
       refuse("send_welcome_email already ran; it never runs twice (if it failed, the email may have been sent: check Sent Mail)");
@@ -327,7 +345,7 @@ export function createSignupConnectorTools(services: SignupServices): ToolSource
       refuse("the latest reviewer reply after the latest draft is not `send`");
     }
     return { input: { to: [account.email], subject: draft.subject, textBody: draft.body }, describe: { draft: { number: draft.number } } };
-  });
+  }, false);
 
   const slackTool = (name: string, operationId: string, description: string, schema: z.ZodObject, operation: Mutation<Record<string, unknown>, unknown>) =>
     connectorTool(operation, slack.reference, {
