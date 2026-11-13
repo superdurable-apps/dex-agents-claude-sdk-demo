@@ -15,6 +15,9 @@ export interface SignupAgentConfig {
   readonly harness: string;
   readonly piModel: string;
   readonly claudeModel: string;
+  /** `login` (the Claude Code login on this machine) or `api-key` (ANTHROPIC_API_KEY). */
+  readonly claudeAuthentication: string;
+  readonly claudeCliPath: string | undefined;
   readonly githubToken: string | undefined;
   readonly watchIntervalMs: number;
   /** Only sign-ups registered at or after this time are reviewed. */
@@ -44,6 +47,10 @@ export function loadSignupAgentConfig(environment: NodeJS.ProcessEnv = process.e
   const optional = (name: string): string | undefined => environment[name]?.trim() || undefined;
   const required = (name: string): string => optional(name) ?? (() => { throw new Error(`${name} is required; see .env.example`); })();
   const apiKey = optional("DEX_API_KEY");
+  const harness = optional("SIGNUP_AGENT_HARNESS") ?? "pi";
+  if (harness !== "pi" && harness !== "claude-agent-sdk") {
+    throw new Error("SIGNUP_AGENT_HARNESS must be pi or claude-agent-sdk");
+  }
   return {
     dex: {
       options: {
@@ -60,9 +67,11 @@ export function loadSignupAgentConfig(environment: NodeJS.ProcessEnv = process.e
     reviewApiKey: required("REVIEW_API_KEY"),
     slackChannelId: required("SLACK_REVIEW_CHANNEL"),
     reviewerSlackIds: new Set(required("SIGNUP_REVIEWER_SLACK_IDS").split(",").map((id) => id.trim()).filter(Boolean)),
-    harness: optional("SIGNUP_AGENT_HARNESS") ?? "pi",
+    harness,
     piModel: optional("SIGNUP_AGENT_PI_MODEL") ?? "anthropic/claude-opus-5-5",
     claudeModel: optional("SIGNUP_AGENT_CLAUDE_MODEL") ?? "claude-opus-5-5",
+    claudeAuthentication: optional("SIGNUP_AGENT_CLAUDE_AUTH") ?? "login",
+    claudeCliPath: optional("SIGNUP_AGENT_CLAUDE_CLI"),
     githubToken: optional("GITHUB_TOKEN"),
     watchIntervalMs: positiveInteger(optional("SIGNUP_WATCH_INTERVAL_SECONDS") ?? "30", "SIGNUP_WATCH_INTERVAL_SECONDS") * 1_000,
     threadPollIntervalMs: positiveInteger(optional("SIGNUP_THREAD_POLL_SECONDS") ?? "60", "SIGNUP_THREAD_POLL_SECONDS") * 1_000,
