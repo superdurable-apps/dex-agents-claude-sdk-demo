@@ -40,22 +40,23 @@ From [`src/signup-agent.ts`](src/signup-agent.ts):
 | --- | --- | --- | --- |
 | `fetch_profile(url)` | One public HTTPS page as text | read | `https` only, 1 MB, 10 s, 3 redirects, every resolved address must be public |
 | `github_user(login)` | GitHub public API: user and top repositories | read | |
-| `post_review(recommendation, reasons, emailSubject, emailBody)` | Slack `postChannelMessage`: the review post, draft 1 in a code block, the harness, the instructions | single attempt | Once per session |
+| `post_review(recommendation, reasons, emailSubject, emailBody)` | Slack `postChannelMessage`: the review post, draft 1 in a code block, the harness, the instructions | single attempt | Once per review: refused once a review post may have gone out, unless the earlier post is found in the channel (see Limits). Refused when `SIGNUP_REVIEWER_SLACK_IDS` lists the Slack app's own user |
 | `post_draft(subject, body)` | Slack `postThreadReply` with `[draft <n>]`, numbered by every post that may have gone out | single attempt | Needs the review thread |
 | `reply_in_thread(text)` | Slack `postThreadReply` | single attempt | Needs the review thread |
 | `approve_account()` | ReviewAPI `approve` with the expected revision and a stable request ID. It asks to leave Dex Cloud's own approval mail out (`suppressApprovedMail`); a server that does not support that yet refuses, and the tool reports the refusal | idempotent | The latest reviewer decision is exactly `approve` (`hold` cancels it). An account already active counts as approved; an account decided the other way returns `superseded`. |
 | `reject_account()` | ReviewAPI `reject`, the same way | idempotent | The latest reviewer decision is `reject <reason>` (`reject?` is no decision) |
-| `send_welcome_email()` | Gmail `sendMessage` of the **latest posted draft** to the applicant | single attempt | Approved in this review, still active, no newer draft whose post is unconfirmed, `send` is the latest reviewer reply and came after that draft, and never attempted before |
+| `send_welcome_email()` | Gmail `sendMessage` of the **latest posted draft** to the applicant | single attempt | Approved in this review, still active, no newer draft whose post is unconfirmed, `send` is the latest reviewer reply and came after that draft, and never attempted before in this review: one send per review, even after a provider error |
 | `finish_review()` | Ends the review | idempotent | The account is no longer pending, and an approved account got its email |
 
 No tool asks for Dex tool approval: the approval is a reviewer's reply in Slack. The guards decide only
 from the review's **ledger** and the ReviewAPI, never from the session's message history, which the
 model's output and tool results shape:
 
-- every write records its effect in the ledger before it dispatches (`attempted`, with what it will
-  do) and after (`succeeded` with the result, or `not_sent` when the provider refused it); without a
-  ledger record there is no dispatch, and an `attempted` effect without an outcome (a crash, a steered
-  or cancelled turn, a failed turn) counts as possibly done;
+- every write records its effect in the ledger before it dispatches (`attempted`) and after
+  (`succeeded` with the ids of the result, or `not_sent` when Slack refused the post); without a
+  ledger record there is no dispatch, a call whose key the ledger already holds is never dispatched
+  again, and an `attempted` effect without an outcome (a crash, a steered or cancelled turn, a failed
+  turn) counts as possibly done;
 - the reviewers' replies are only those the ledger recorded from Slack, from listed reviewers; the
   `[slack <ts>] …` message it sends the session is just the model's notification, so a message sent
   to the session some other way, or text in a fetched page that looks like a reviewer's reply,
@@ -66,8 +67,9 @@ applicant or the model is escaped, and the email shows in a code block exactly a
 Gmail tools are Dex connector tools ([`@superdurable/connector-slack`](https://www.npmjs.com/package/@superdurable/connector-slack),
 [`@superdurable/connector-google-gmail`](https://www.npmjs.com/package/@superdurable/connector-google-gmail)):
 each call is one connector call in its own Dex Step under the connector's call identity and dispatch
-fence, so a crash never posts or sends twice. A send whose outcome Dex cannot confirm is never
-repeated; the agent says in the thread that the email may have been sent (check Sent Mail).
+fence, so a crash never posts or sends twice. A send is never repeated: a provider error after the
+dispatch does not prove that no email went out, so the send stays `attempted`, and the agent says in
+the thread to check Sent Mail and, if nothing went out, to send the email manually.
 
 ## The harness
 
@@ -100,23 +102,29 @@ review call by call, and a crash repeats at most the one call that was running.
   per account, ever. The ledger is `signup-review-<accountId>-ledger` with Request ID
   `<accountId>-ledger`; a ledger that ended while its session still runs is started again, at most 3
   times, under Request ID `<accountId>-ledger-after-<ended run>`, with the ended run's effects,
-  replies and cursor as its initial Attributes. One account's failure never holds up the others.
+  replies and cursors as its initial Attributes. Each round also searches the running sessions (at most
+  500), so a review whose account is no longer pending still gets its ledger back. When a ledger ended
+  before its session existed, or the 3 restarts are used up, the watcher cancels the session: no
+  review runs without a ledger. One account's failure never holds up the others.
 - **SignupReviewLedgerFlow** ([`src/review-ledger-flow.ts`](src/review-ledger-flow.ts)), one per review,
   the review's single authoritative record:
   - Attributes `Effects` (the effects, keyed by the Dex per-call key of the write tool call),
-    `RelayedReplies`, `Cursor` (the last relayed reply), `ReportedStatus` and `Restarts`; the guards
-    read them with `getAttributes`.
-  - RPC `record_effect({callKey, tool, status, payload?, result?})`, under a lock on `Effects`:
-    `attempted` adds an effect once, `succeeded` completes it, `not_sent` applies only to an attempted
-    one, and a succeeded effect never changes. A retry of a recorded call skips its guard and
-    dispatches its recorded input again under the connector's own call identity and fence.
-  - Its polling Step reads the review thread every 15 seconds with the Slack connector's
-    `listThreadMessages`, in one long-running Execute (the Dex polling pattern). Each new reviewer
+    `RelayedReplies`, `Cursor` (the last relayed reply), `ThreadPage` (the thread page being read),
+    `ReportedStatus` and `Restarts`; the guards read them with `getAttributes`.
+  - RPC `record_effect({callKey, tool, status, result?})`, under a lock on `Effects`: `attempted`
+    adds an effect once and is refused for `post_review` or `send_welcome_email` when one may
+    already have happened, `succeeded` completes an effect, `not_sent` applies only to an attempted
+    one, and a succeeded effect never changes. `Effects` holds at most 256 KB; the ledger refuses a
+    record beyond that, and the tool then does not dispatch. A tool whose record meets a lock conflict
+    tries again, up to 4 times within about a second.
+  - Its polling Step reads one page (15 messages) of the review thread every 60 seconds with the
+    Slack connector's `listThreadMessages`, in one long-running Execute (the Dex polling pattern);
+    after a full page it moves on to the next page and never reads the earlier ones again. Each new reviewer
     reply is recorded with the `Cursor`, committed, and only then sent to the session as
     `[slack <ts>] <@user>: <text>`, when the session does not hold it yet; a restarted ledger first
-    sends the replies it carries. A Slack 429 or 5xx, a busy ReviewAPI, a passing Dex error or a round
-    over 40 seconds skips a round with a back-off; a crash retries the Step until the review's time is
-    up. Every minute it also tells the session when the account was decided in Dex Cloud admin
+    sends the replies it carries. A round only reads; what it found is written after it, so a round
+    over 40 seconds is abandoned without a trace. A Slack 429 or 5xx, a busy ReviewAPI, a passing Dex
+    error or such a timeout skips a round with a back-off; a crash retries the Step up to 4 times. Every round it also tells the session when the account was decided in Dex Cloud admin
     (`[dex-cloud <status>]`), once. It stops the session when the review finished; after 7 days from
     the session's start, when the session failed, or after a lasting failure it stops the session and
     posts a note in the thread.
@@ -158,7 +166,7 @@ You need Node.js 22.19 or later (24 recommended, `.nvmrc`) and
 | `SIGNUP_AGENT_PI_MODEL`, `ANTHROPIC_API_KEY` | The pi-ai model (`anthropic/claude-opus-5-5`) and its key |
 | `GITHUB_TOKEN` | Optional, raises the GitHub API rate limit |
 | `SIGNUP_REVIEW_SINCE` | Required. RFC 3339 time, such as `2026-11-13T00:00:00Z`: only sign-ups registered since then are reviewed |
-| `SIGNUP_WATCH_INTERVAL_SECONDS`, `SIGNUP_THREAD_POLL_SECONDS` | Seconds between reads of the pending sign-ups (30) and of each thread (15, at most 40) |
+| `SIGNUP_WATCH_INTERVAL_SECONDS`, `SIGNUP_THREAD_POLL_SECONDS` | Seconds between reads of the pending sign-ups (30) and of each thread (60; Slack may allow a non-Marketplace app one thread read a minute) |
 
 ## Tests
 
@@ -171,14 +179,17 @@ wrote, and a send before `send`, both refused (a refused send is no attempt); a 
 to the session directly instead of relayed; a server that refuses to leave its approval mail out; a
 bystander's and the bot's own messages ignored and each reply relayed once; an approval whose answer
 was lost and whose retry counts as approved; vague (`reject?`), conflicting and held replies; a
-`hold` after `send`; two tool calls in one model response; a send in a turn that then failed; a
+`hold` after `send`; two tool calls in one model response; a send in a turn whose next model call failed; a
 draft whose post is uncertain blocking the email; a send whose outcome is unknown, never repeated; a
 rejection; an account decided in Dex Cloud admin while the ReviewAPI is busy; an unconfirmed review
 post found in the channel; a fetched profile that pretends to be a reviewer's `approve`; a sign-up
 from before `SIGNUP_REVIEW_SINCE`; the ledger resuming after a Worker restart and, restarted, keeping its
-effects and a reviewer's `approve`; an attempted send without an outcome (as a crash, steer or cancel
-leaves it); a forged turn-failure note and a tool result that nests a sent call's ID under another
-tool name; a send asked for second in one response; a session without a ledger. `fetch_profile` is checked for private
+effects and a reviewer's `approve`; an attempted send record injected through `record_effect` (as a
+crash, steer or cancel leaves it); a send the provider refused after the dispatch, which stays
+blocked; `record_effect` refusing a second once-only attempt and a `not_sent` without an attempt; a
+round abandoned by its timeout writing nothing; one thread page a round with the page cursor moving
+on; a record retried after a lock conflict; a forged turn-failure note and a tool result that nests a sent call's ID under another
+tool name; a send asked for second in one response; a session without a ledger, where every write tool refuses. `fetch_profile` is checked for private
 addresses through an injected lookup, for redirects to private addresses, and for linear-time parsing
 of adversarial HTML.
 
@@ -186,12 +197,16 @@ of adversarial HTML.
 
 - A second `post_review` is refused rather than turned into a thread reply; the agent uses
   `reply_in_thread`.
-- A review post whose outcome is unknown is not simply posted again: the next `post_review` first reads
-  one page of the channel since that call (Slack connector 0.5 `listChannelMessages`) for the app's
-  own message, matched by the app's bot ID or bot user from `getWorkspaceIdentity`, whose last line is
+- A review post whose outcome is unknown is never posted again: the next `post_review` reads one page
+  of the channel since that call (Slack connector 0.5 `listChannelMessages`) for the app's own
+  message, matched by the app's bot ID or bot user from `getWorkspaceIdentity`, whose last line is
   the review's footer, and adopts it when found. When that post shows another draft, the thread is
-  adopted without a draft and the agent posts its draft with `post_draft`. Slack may allow a
-  non-Marketplace app one history read per minute, so only this reconciliation reads channel history.
+  adopted without a draft and the agent posts its draft with `post_draft`. When it is not found, the
+  tool refuses and the review is decided in Dex Cloud admin. Slack may allow a non-Marketplace app
+  one history read per minute, so only this reconciliation reads channel history.
+- The check that `SIGNUP_REVIEWER_SLACK_IDS` does not list the app's own Slack user runs in
+  `post_review`, not at Worker start: the identity read is a connector call, and connector calls run
+  inside a Dex Step.
 - If an admin approves the account in Dex Cloud admin while the reviewers' latest decision is also
   `approve`, the review counts the account as approved and may still send its welcome email, next to
   the platform's own approval mail.
@@ -200,7 +215,10 @@ of adversarial HTML.
   Decisions are not affected, since the guards read the ledger's `RelayedReplies`; at worst the agent posts one
   extra draft.
 - Every review finishes within 7 days, or its ledger stops it.
-- Each round reads at most 300 messages of the thread (20 pages of 15); replies beyond that are not seen.
+- Each open review's ledger holds one Worker slot while it polls (one long-running Step). A Worker has
+  as many slots as logical CPUs by default, so with that many open reviews no slot is left for the
+  sessions; run more Workers, or raise `maxConcurrentTasks`, before reviewing more sign-ups at once.
+  A Slack thread-reply Trigger would remove this limit.
 - The ReviewAPI lists pending sign-ups oldest first, and a round reads at most 10 pages of 100: with a
   backlog of more than 1,000 older pending sign-ups, newer ones are not reached. `SIGNUP_REVIEW_SINCE`
   only filters what a round read.
