@@ -54,6 +54,11 @@ export class ScriptedMessagesApi {
     const toolNames = ((payload.tools as JsonObject[] | undefined) ?? []).map((tool) => String(tool.name));
     toolNames.forEach((name) => this.offeredTools.add(name));
     const blocks = reply((payload.messages as JsonObject[] | undefined) ?? [], toolNames);
+    if (blocks === "fail") {
+      response.writeHead(400, { "content-type": "application/json" });
+      response.end(JSON.stringify({ type: "error", error: { type: "invalid_request_error", message: "scripted model failure" } }));
+      return;
+    }
     const model = String(payload.model ?? "claude-scripted");
     if (payload.stream === true) {
       stream(response, model, blocks);
@@ -63,7 +68,7 @@ export class ScriptedMessagesApi {
   }
 }
 
-function reply(messages: readonly JsonObject[], toolNames: readonly string[]): ContentBlock[] {
+function reply(messages: readonly JsonObject[], toolNames: readonly string[]): ContentBlock[] | "fail" {
   let commandIndex = -1;
   const userTexts: string[] = [];
   messages.forEach((entry, index) => {
@@ -92,12 +97,19 @@ function reply(messages: readonly JsonObject[], toolNames: readonly string[]): C
     }
   }
   const step = decideNextStep(userTexts, seen);
+  if (step.kind === "fail") {
+    return "fail";
+  }
   if (step.kind === "answer") {
     return [{ type: "text", text: step.text }];
   }
-  // The CLI offers custom and source tools as mcp__<server>__<tool>.
-  const name = toolNames.find((candidate) => bare(candidate) === step.name) ?? step.name;
-  return [{ type: "tool_use", id: `toolu_${randomUUID().replaceAll("-", "").slice(0, 20)}`, name, input: { ...step.arguments } }];
+  // The CLI offers custom and source tools as mcp__<server>__<tool>; several calls become several tool_use blocks.
+  return step.calls.map((call) => ({
+    type: "tool_use",
+    id: `toolu_${randomUUID().replaceAll("-", "").slice(0, 20)}`,
+    name: toolNames.find((candidate) => bare(candidate) === call.name) ?? call.name,
+    input: { ...call.arguments },
+  }));
 }
 
 function stream(response: ServerResponse, model: string, blocks: readonly ContentBlock[]): void {
