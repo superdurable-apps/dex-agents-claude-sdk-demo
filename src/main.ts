@@ -5,6 +5,7 @@ import { newProjectConnection as newSlackConnection } from "@superdurable/connec
 import { loadFromEnvironment } from "@superdurable/connectors-sdk/projectconfig";
 import { Client, Registry, Worker, openBlobCache } from "@superdurable/dex";
 
+import { claudeCliEnvironment, claudeHarnessLabel, createClaudeSignupAgent } from "./claude-agent.js";
 import { loadSignupAgentConfig } from "./config.js";
 import { createPiSignupAgent, piHarnessLabel, piModel } from "./pi-agent.js";
 import { PublicProfileSources } from "./profile-sources.js";
@@ -24,10 +25,18 @@ const services: SignupServices = {
   slack: newSlackConnection(project, "review-slack"),
   gmail: newGmailConnection(project, "welcome-gmail"),
   slackChannelId: config.slackChannelId,
-  harnessLabel: piHarnessLabel,
+  harnessLabel: config.harness === "claude-agent-sdk" ? claudeHarnessLabel : piHarnessLabel,
 };
 
-const sessionFlow = createPiSignupAgent(services, piModel(config.piModel));
+// SIGNUP_AGENT_HARNESS picks the harness; the prompt, the tools and the ledger are the same for both.
+const sessionFlow =
+  config.harness === "claude-agent-sdk"
+    ? createClaudeSignupAgent(services, {
+        model: config.claudeModel,
+        cliEnvironment: claudeCliEnvironment(config.claudeAuthentication),
+        ...(config.claudeCliPath === undefined ? {} : { cliPath: config.claudeCliPath }),
+      })
+    : createPiSignupAgent(services, piModel(config.piModel));
 let client: Client | undefined;
 const ledgerFlow = new SignupReviewLedgerFlow({
   ...services,
