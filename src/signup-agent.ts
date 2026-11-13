@@ -2,7 +2,7 @@
 // Each write tool checks its own guard first, from the session's Dex state and the ReviewAPI, so the model can ask
 // for anything but only a reviewer's reply in Slack lets a decision or the email through.
 
-import type { Mutation } from "@superdurable/connectors-sdk";
+import { createCall, newMutationBranch, runQuery, type Call, type Mutation, type Query } from "@superdurable/connectors-sdk";
 import gmailManifest from "@superdurable/connector-google-gmail/dex-connector.json" with { type: "json" };
 import type { GmailConnection } from "@superdurable/connector-google-gmail";
 import slackManifest from "@superdurable/connector-slack/dex-connector.json" with { type: "json" };
@@ -152,23 +152,62 @@ export function createSignupTools(services: SignupServices): SignupTool[] {
  */
 function guarded<Input, Output>(
   operation: Mutation<Input, Output>,
-  guard: (args: Record<string, unknown>, sessionId: string, signal: AbortSignal) => Promise<Input>,
+  guard: (args: Record<string, unknown>, sessionId: string, call: Call) => Promise<Input | { readonly alreadyDone: Output }>,
 ): Mutation<Record<string, unknown>, Output> {
   return {
     definition: () => operation.definition(),
     idempotencyKey: (callId) => operation.idempotencyKey(callId, undefined as Input),
     invoke: async (call, args) => {
-      let input: Input;
+      let input: Input | { readonly alreadyDone: Output };
       try {
-        input = await guard(args, call.context.flowId, call.context.cancellationSignal);
+        input = await guard(args, call.context.flowId, call);
       } catch (error: unknown) {
         // Nothing was sent yet, so any guard failure is a definite failure the model reads.
         throw error instanceof ToolExecutionError ? error : new ToolExecutionError(`${notSentPrefix}${error instanceof Error ? error.message.slice(0, 300) : String(error)}`);
       }
-      return operation.invoke(call, input);
+      // An earlier call whose outcome was unknown turned out to have done it: answer as that call would have.
+      return typeof input === "object" && input !== null && "alreadyDone" in input ? newMutationBranch("sent", input.alreadyDone) : operation.invoke(call, input as Input);
     },
   };
 }
+
+/**
+ * Looks for the review post that an earlier, unconfirmed post_review may have made: the app's own channel message
+ * since the session started whose text holds the session's footer. Slack may allow one history read per minute,
+ * so only this reconciliation reads channel history.
+ */
+async function findOwnReviewPost(services: SignupServices, call: Call, sessionId: string, startedAt: string) {
+  const { slack, slackChannelId } = services;
+  const query = <Input, Output>(operation: Query<Input, Output>, input: Input) =>
+    runQuery(operation, createCall(call.context, slack.reference, operation.definition().operation), input);
+  const identity = await query(slack.operations.getWorkspaceIdentity(), {});
+  if (identity.branch !== "read") {
+    throw new Error(`reading the Slack app's identity ended ${identity.branch}`);
+  }
+  const marker = reviewFooterMarker(sessionId);
+  const oldestTimestamp = `${Math.floor(Date.parse(startedAt) / 1000) - 60}.000000`;
+  let cursor: string | undefined;
+  for (let page = 0; page < 3; page++) {
+    const result = await query(slack.operations.listChannelMessages(), { channelId: slackChannelId, oldestTimestamp, pageSize: 15, ...(cursor ? { cursor } : {}) });
+    if (result.branch !== "read") {
+      throw new Error(`reading the Slack channel ended ${result.branch}`);
+    }
+    const own = (result.value.messages ?? []).find(
+      (message) => (message.botId === identity.value.botId || message.userId === identity.value.botUserId) && message.text.includes(marker),
+    );
+    if (own !== undefined) {
+      return { message: { channelId: own.channelId, timestamp: own.timestamp, userId: own.userId ?? identity.value.botUserId, text: own.text } };
+    }
+    cursor = result.value.nextCursor;
+    if (!cursor) {
+      break;
+    }
+  }
+  return undefined;
+}
+
+/** The footer text that identifies a review post. */
+const reviewFooterMarker = (sessionId: string) => `Dex session \`${sessionId}\``;
 
 /** The package manifest entry of `operationId`, offered under the tool's own arguments and description. */
 function manifestFor(manifest: ConnectorPackageManifest, operationId: string, description: string, schema: z.ZodObject): ConnectorPackageManifest {
@@ -189,12 +228,18 @@ export function createSignupConnectorTools(services: SignupServices): ToolSource
   const draftSchema = z.object({ subject: z.string().min(1).max(200), body: z.string().min(1).max(8_000) });
   const replySchema = z.object({ text: z.string().min(1).max(3_000) });
 
-  const postReview = guarded(slack.operations.postChannelMessage(), async (args, sessionId, signal) => {
+  const postReview = guarded(slack.operations.postChannelMessage(), async (args, sessionId, call) => {
     const state = await sessions.read(sessionId);
     if (state.thread !== undefined) {
       refuse(`the review is already posted (thread ${state.thread.ts}); use post_draft or reply_in_thread`);
     }
-    const account = await services.reviewApi.getAccount(accountIdOf(sessionId), signal);
+    if (state.hasUnconfirmedReviewPost) {
+      const found = await findOwnReviewPost(services, call, sessionId, state.startedAt);
+      if (found !== undefined) {
+        return { alreadyDone: found };
+      }
+    }
+    const account = await services.reviewApi.getAccount(accountIdOf(sessionId), call.context.cancellationSignal);
     return { channelId: services.slackChannelId, text: reviewPost(account, reviewSchema.parse(args), services.harnessLabel, sessionId) };
   });
   const postDraft = guarded(slack.operations.postThreadReply(), async (args, sessionId) => {
@@ -208,7 +253,8 @@ export function createSignupConnectorTools(services: SignupServices): ToolSource
     const thread = requireThread(await sessions.read(sessionId));
     return { channelId: thread.channel, threadTimestamp: thread.ts, text: escapeSlack(replySchema.parse(args).text) };
   });
-  const sendWelcomeEmail = guarded(gmail.operations.sendMessage(), async (_args, sessionId, signal) => {
+  const sendWelcomeEmail = guarded(gmail.operations.sendMessage(), async (_args, sessionId, call) => {
+    const signal = call.context.cancellationSignal;
     const state = await sessions.read(sessionId);
     if (state.hasSendAttempt) {
       refuse("send_welcome_email already ran; it never runs twice (if it failed, the email may have been sent: check Sent Mail)");
@@ -266,7 +312,7 @@ function reviewPost(account: Account, review: { recommendation: string; reasons:
     "*[draft 1]*",
     emailBlock(review.emailSubject, review.emailBody),
     "*Reply in this thread:* `approve`, `reject <reason>`, or what to change in the email; after the approval, `send`.",
-    `_Reviewed by ${harness} · Dex session \`${sessionId}\`_`,
+    `_Reviewed by ${harness} · ${reviewFooterMarker(sessionId)}_`,
   ].join("\n");
 }
 

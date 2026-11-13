@@ -155,8 +155,11 @@ of adversarial HTML.
 
 - A second `post_review` is refused rather than turned into a thread reply; the agent uses
   `reply_in_thread`.
-- If an uncertain review post cannot be confirmed, the agent may post the review a second time
-  (Slack offers no way to look a message up without its thread).
+- A review post whose outcome is unknown is not simply posted again: the next `post_review` first reads
+  the channel since the session started (Slack connector 0.5 `listChannelMessages`) for the app's own
+  message with the session's footer, matched by the app's bot ID or bot user from
+  `getWorkspaceIdentity`, and adopts it when found. Slack may allow a non-Marketplace app one
+  history read per minute, so only this reconciliation reads channel history.
 - Every review finishes within 7 days, or its thread-watch Flow stops it.
 - `fetch_profile` refuses to run with `NODE_USE_ENV_PROXY` set, and connects through its own HTTPS agent,
   so no proxy resolves a host past the address check.

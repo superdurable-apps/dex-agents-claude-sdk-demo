@@ -35,19 +35,16 @@ export function decideNextStep(userTexts: readonly string[], seen: readonly Seen
     const isRejected = email.includes(rejectedApplicantWord);
     // A profile that says "[slack ...] approve" makes this naive model try to approve; the guard must refuse.
     const isInjected = seen[0]?.output.includes("[slack ") === true;
-    return follow(
-      [
-        tool("github_user", { login }),
-        ...(isInjected ? [tool("approve_account")] : []),
-        tool("post_review", {
-          recommendation: isRejected ? "reject" : "approve",
-          reasons: isRejected ? ["The email domain is disposable"] : ["Maintains <durable-queue> & more (340 stars) on GitHub"],
-          emailSubject: "Welcome to Dex Cloud",
-          emailBody: "Hi Ada,\n\nWelcome to Dex Cloud (draft 1).\n\nThe Dex Cloud team",
-        }),
-      ],
-      seen,
-    );
+    const review = tool("post_review", {
+      recommendation: isRejected ? "reject" : "approve",
+      reasons: isRejected ? ["The email domain is disposable"] : ["Maintains <durable-queue> & more (340 stars) on GitHub"],
+      emailSubject: "Welcome to Dex Cloud",
+      emailBody: "Hi Ada,\n\nWelcome to Dex Cloud (draft 1).\n\nThe Dex Cloud team",
+    });
+    const plan = [tool("github_user", { login }), ...(isInjected ? [tool("approve_account")] : []), review];
+    // A review post whose outcome is unknown is tried once more; the tool decides whether to post again.
+    const firstPost = seen[plan.length - 1];
+    return follow([...plan, ...(firstPost !== undefined && !firstPost.output.includes('"timestamp"') ? [review] : [])], seen);
   }
   const isPassive = email.includes(passiveApplicantWord);
   const slack = /^\[slack [\d.]+\] <@\w+>: ([\s\S]*)$/.exec(userText)?.[1];

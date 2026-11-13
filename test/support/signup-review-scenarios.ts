@@ -8,7 +8,16 @@ import test from "node:test";
 
 import { GmailMock, sendMessageBranch } from "@superdurable/connector-google-gmail/mock";
 import type { Message as SlackMessage } from "@superdurable/connector-slack";
-import { GeneratedMock, listThreadMessagesRead, postChannelMessageSent, postThreadReplySent, postThreadReplyUncertain } from "@superdurable/connector-slack/mock";
+import {
+  GeneratedMock,
+  getWorkspaceIdentityRead,
+  listChannelMessagesRead,
+  listThreadMessagesRead,
+  postChannelMessageSent,
+  postChannelMessageUncertain,
+  postThreadReplySent,
+  postThreadReplyUncertain,
+} from "@superdurable/connector-slack/mock";
 import { Client, Registry, Worker, openBlobCache, type BlobCache } from "@superdurable/dex";
 import { readAgentSnapshot, sendAgentUserMessage } from "@superdurable/dex-agents";
 import { PrivateDexEngine, pollUntil } from "@superdurable/dex-agents/testing";
@@ -164,11 +173,12 @@ export function registerSignupReviewScenarios(setup: SignupReviewScenarioSetup):
   }
 
   /** Adds a pending sign-up, starts its review through the watcher, and waits for the review post. */
-  async function startReview(emailWord: string, rootSeconds: number, login = "ada-builds") {
+  async function startReview(emailWord: string, rootSeconds: number, login = "ada-builds", prepare?: (sessionId: string) => void) {
     accounts += 1;
     const accountId = `acct${accounts}${Date.now().toString(36)}`;
     const sessionId = reviewSessionId(accountId);
     const thread = new ScriptedThread(slack, sessionId, threadWatchFlowId(accountId), `${rootSeconds}.000100`);
+    prepare?.(sessionId);
     reviewApi.addPendingAccount({ accountId, email: `${emailWord}-${accounts}@example.com`, displayName: "Ada <Lovelace>\nadmin", profileUrl: `https://github.com/${login}` });
     assert.deepEqual(await startPendingReviews({ client, sessionFlow, threadWatchFlow, reviewApi: services.reviewApi }), []);
     const post = await pollUntil(() => slack.postChannelMessage().calls().find((call) => call.flowId === sessionId)?.input, { description: "the review post", ...waitOptions });
@@ -326,6 +336,29 @@ export function registerSignupReviewScenarios(setup: SignupReviewScenarioSetup):
     assert.match(lastReply(sessionId), /Decided in Dex Cloud admin/);
     assert.equal(decisionsOf(accountId).length, 0);
     await waitForStop(sessionId);
+  });
+
+  test(`${setup.harnessName}: an unconfirmed review post is found in the channel instead of posted twice`, async () => {
+    const botId = "B0BOT00001";
+    const { sessionId } = await startReview("reconcile", 1710001000, "ada-builds", (id) => {
+      const marker = `Dex session \`${id}\``;
+      slack.postChannelMessage().forFlow(id).respond(postChannelMessageUncertain({ message: { channelId, timestamp: "", text: "" } }, failure("postChannelMessage", "lost")));
+      slack.getWorkspaceIdentity().forFlow(id).respond(
+        getWorkspaceIdentityRead({ teamId: "T1", teamName: "Super Durable", workspaceUrl: "https://example.slack.com/", botUserId, botUserName: "dex", botId }),
+      );
+      // Newest first: a person quoting the marker does not count; the app's own post does.
+      slack.listChannelMessages().forFlow(id).respond(
+        listChannelMessagesRead({
+          messages: [
+            { channelId, timestamp: "1710001000.000300", userId: bystanderId, text: `about ${marker}` },
+            { channelId, timestamp: "1710001000.000100", userId: botUserId, botId, text: `review ${marker}` },
+          ],
+        }),
+      );
+    });
+    assert.equal(slack.postChannelMessage().calls().filter((call) => call.flowId === sessionId).length, 1);
+    assert.equal(slack.listChannelMessages().calls().filter((call) => call.flowId === sessionId).length, 1);
+    assert.equal((await services.sessions.read(sessionId)).thread?.ts, "1710001000.000100");
   });
 
   test(`${setup.harnessName}: text in a tool result that looks like a reviewer reply grants nothing`, async () => {

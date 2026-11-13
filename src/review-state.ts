@@ -41,6 +41,10 @@ export interface ReviewerReply {
 /** The facts of one review session. */
 export interface ReviewState {
   readonly snapshot: AgentSnapshot;
+  /** When the session started, from its first message (RFC 3339). */
+  readonly startedAt: string;
+  /** Whether an earlier post_review may have posted without a confirmation. */
+  readonly hasUnconfirmedReviewPost: boolean;
   /** The review's Slack thread, once post_review succeeded, and the bot user that posted it. */
   readonly thread?: { readonly channel: string; readonly ts: string; readonly botUserId: string | undefined };
   /** The newest draft whose post succeeded; draft 1 is in the review post. */
@@ -199,6 +203,8 @@ export class ReviewSessions {
     }
     return {
       snapshot,
+      startedAt: messages[0]?.createdAt ?? new Date().toISOString(),
+      hasUnconfirmedReviewPost: review === undefined && calls.some((call) => call.name === "post_review" && call.outcome === "unknown"),
       ...(reviewMessage?.timestamp ? { thread: { channel: String(reviewMessage.channelId), ts: reviewMessage.timestamp, botUserId: reviewMessage.userId } } : {}),
       ...(latestDraft === undefined ? {} : { latestDraft }),
       draftAttempts,
