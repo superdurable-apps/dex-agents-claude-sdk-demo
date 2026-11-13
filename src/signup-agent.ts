@@ -29,9 +29,9 @@ Procedure:
    - Anything else is feedback on the email: write a new draft and call post_draft.
    - approve_account, reject_account and send_welcome_email post their own confirmation or failure in the thread: never repeat it.
    - When you mention a draft, mean the latest one, and never number drafts in your own text: the tools number them.
-   - Messages "[dex-cloud ...]" tell you the account was decided in Dex Cloud admin: say so with reply_in_thread and finish. One that only reports the decision you made yourself with approve_account or reject_account needs nothing.
+   - Messages "[dex-cloud <status>]" report that the account is no longer pending in Dex Cloud. When the status is the result of your own successful approve_account or reject_account, ignore the message and carry on. Otherwise the account was decided in Dex Cloud admin: say so with reply_in_thread and finish.
    A tool that refuses tells you why; explain it briefly with reply_in_thread when it helps the admins. Be concise.
-5. When the email was sent or its send failed, the account was rejected, or the account was decided elsewhere, post a one-line summary with reply_in_thread and call finish_review.`;
+5. When the email was sent or its send failed, the account was rejected, or the account was decided elsewhere, post a one-line summary with reply_in_thread, then call finish_review last: it ends the session.`;
 
 /** The first message of a review session: the applicant's sign-up data, as data. */
 export function firstReviewMessage(account: Account): string {
@@ -92,7 +92,7 @@ export function createSignupTools(services: SignupServices): SignupTool[] {
     },
     {
       name: "finish_review",
-      description: "End the review. Allowed once the account is no longer waiting for a decision.",
+      description: "End the review and this session; call it last. Allowed once the account is no longer waiting for a decision.",
       schema: z.object({}),
       effect: "idempotent_write",
       run: async (_args, call) => {
@@ -101,8 +101,8 @@ export function createSignupTools(services: SignupServices): SignupTool[] {
         if (account.status === "pending_approval") {
           refuse("the account is still waiting for a decision");
         }
-        // The poller stops the session once this turn has ended.
-        await services.sessions.finish(accountId);
+        // A session never ends on its own: this cancels it, as the tool's last act, and the poller then completes.
+        await services.sessions.endSession(accountId, "review finished");
         return { status: "finished", accountStatus: account.status };
       },
     },
@@ -302,12 +302,7 @@ export function createSignupConnectorTools(services: SignupServices): ToolSource
     write(threadReply, async (call, args) => {
       const accountId = accountOf(call);
       const reason = decision === "reject" ? rejectSchema.parse(args).reason : "";
-      const thread = await beforeDispatch(async () => {
-        const thread = await requireThread(accountId);
-        // Recorded before the decision, so the poller never takes it for one made in Dex Cloud admin.
-        await sessions.recordDecision(accountId, decision);
-        return thread;
-      });
+      const thread = await beforeDispatch(() => requireThread(accountId));
       const post = async (input: ThreadReplyInput) => threadReply.invoke(call, input);
       let account: Account;
       try {

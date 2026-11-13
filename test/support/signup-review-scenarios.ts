@@ -15,7 +15,7 @@ import { PrivateDexEngine, pollUntil } from "@superdurable/dex-agents/testing";
 
 import { ReviewApiClient } from "../../src/review-api.js";
 import { ReviewSessions, reviewPollerId, reviewSessionId, type ReviewSessionFlow } from "../../src/review-state.js";
-import { SignupReviewThreadPoller, latestDraft, reportedStatus, threadCursor, threadPage } from "../../src/review-thread-poller.js";
+import { SignupReviewThreadPoller, latestDraft, threadCursor, threadPage } from "../../src/review-thread-poller.js";
 import { type SignupServices } from "../../src/signup-agent.js";
 import { startPendingReviews } from "../../src/signup-watcher.js";
 import { ReviewApiTestStub } from "./review-api-test-stub.js";
@@ -168,10 +168,14 @@ export function registerSignupReviewScenarios(setup: SignupReviewScenarioSetup):
   const sent = (messageId: string) => sendMessageBranch("sent", { sender: "<hello@example.com>", recipients: ["<ada@example.com>"], messageId, threadId: "t-1" });
   const applicant = (accountId: string) => `Ada &lt;Lovelace&gt; admin 'tick' (${reviewApi.accountOf(accountId)!.email})`;
 
-  /** Waits until the session finished more than `afterTurns` turns and waits for the next message. */
+  /** Waits until the session finished more than `afterTurns` turns and waits for the next message, or has ended. */
   async function waitForIdle(sessionId: string, afterTurns = 0): Promise<void> {
     await pollUntil(
       async () => {
+        // finish_review ends the session inside its turn, so an ended session is done too.
+        if ((await client.describeFlow(sessionId)).status !== "running") {
+          return true;
+        }
         const snapshot = await snapshotOf(sessionId);
         return snapshot.state?.status === "waiting_for_user_message" && snapshot.queuedMessageCount === 0 && snapshot.state.turnCount > afterTurns ? true : undefined;
       },
@@ -261,13 +265,15 @@ export function registerSignupReviewScenarios(setup: SignupReviewScenarioSetup):
     assert.equal((await client.getAttributes(reviewPollerId(accountId), threadCursor))[0], sendTs);
     await waitForStop(accountId);
 
-    // Each listed reviewer's reply reached the session once; nobody else's did, and the agent's own approval was not
-    // reported as a decision made in Dex Cloud admin.
+    // Each listed reviewer's reply reached the session once and nobody else's did; the agent's own approval may have
+    // been reported once as `[dex-cloud active]`, which changed nothing.
     const relayed = await userTexts(sessionId);
     assert.equal(relayed.filter((text) => text.startsWith(`[slack ${feedbackTs}]`)).length, 1);
     assert.equal(relayed.filter((text) => text.startsWith("[slack ")).length, 4);
     assert.equal(relayed.filter((text) => text.includes(bystanderId) || text.includes(botUserId)).length, 0);
-    assert.equal(relayed.filter((text) => text.startsWith("[dex-cloud")).length, 0);
+    assert.ok(relayed.filter((text) => text.startsWith("[dex-cloud")).every((text) => text.startsWith("[dex-cloud active]")));
+    assert.ok(relayed.filter((text) => text.startsWith("[dex-cloud active]")).length <= 1);
+    assert.ok(!threadReplies(sessionId).some((text) => /Decided in Dex Cloud admin/.test(text)));
   });
 
   test(`${setup.harnessName}: an approval the server refuses posts the failure in the thread`, async () => {
@@ -292,15 +298,25 @@ export function registerSignupReviewScenarios(setup: SignupReviewScenarioSetup):
     assert.match(threadReplies(sessionId).at(-1)!, /^Approved /);
   });
 
-  test(`${setup.harnessName}: the agent's own approval is never reported as a Dex Cloud admin decision, even after a hold`, async () => {
+  test(`${setup.harnessName}: the agent's own approval reported as [dex-cloud active], once, does no harm, even after a hold`, async () => {
     const { accountId, sessionId, thread } = await startReview("heldapproval", 1710000220);
     await replyAndWait(sessionId, thread, "approve");
     assert.equal(reviewApi.accountOf(accountId)?.status, "active");
     await replyAndWait(sessionId, thread, "hold");
-    // Many account checks later the session still waits for `send`.
+    await pollUntil(async () => ((await userTexts(sessionId)).some((text) => text.startsWith("[dex-cloud active]")) ? true : undefined), {
+      description: "the poller reports the active account",
+      ...waitOptions,
+    });
+    // Many account checks later the notice is still there once, and the session still waits for `send`.
     await new Promise((resolve) => setTimeout(resolve, 3_000));
-    assert.equal((await userTexts(sessionId)).filter((text) => text.startsWith("[dex-cloud")).length, 0);
+    await waitForIdle(sessionId);
+    assert.equal((await userTexts(sessionId)).filter((text) => text.startsWith("[dex-cloud")).length, 1);
     assert.equal((await client.describeFlow(sessionId)).status, "running");
+    assert.ok(!threadReplies(sessionId).some((text) => /Decided in Dex Cloud admin/.test(text)));
+    gmail.sendMessage().forFlow(sessionId).respond(sent("gmail-held"));
+    await replyAndWait(sessionId, thread, "send");
+    assert.equal(sendsOf(sessionId).length, 1);
+    await waitForStop(accountId);
   });
 
   test(`${setup.harnessName}: a confirmation that fails to post leaves the approval as it is`, async () => {
@@ -412,7 +428,6 @@ export function registerSignupReviewScenarios(setup: SignupReviewScenarioSetup):
     reviewApi.getDelayMs = 3_000;
     try {
       await new Promise((resolve) => setTimeout(resolve, 5_000));
-      assert.equal((await client.getAttributes(reviewPollerId(accountId), reportedStatus))[0], undefined);
       assert.equal((await userTexts(sessionId)).filter((text) => text.startsWith("[dex-cloud")).length, 0);
     } finally {
       reviewApi.getDelayMs = 0;

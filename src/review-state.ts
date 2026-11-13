@@ -3,7 +3,7 @@
 
 import { setTimeout as sleep } from "node:timers/promises";
 
-import { FlowNotActiveOrNotFoundError, FlowNotFoundError, IdReusePolicy, InitialAttribute, type Client } from "@superdurable/dex";
+import { FlowNotActiveOrNotFoundError, FlowNotFoundError, IdReusePolicy, InitialAttribute, StopType, type Client } from "@superdurable/dex";
 import {
   readAgentSnapshot,
   sendAgentUserMessage,
@@ -14,7 +14,7 @@ import {
   type DeferredToolOutcome,
 } from "@superdurable/dex-agents";
 
-import { agentDecision, finishedAt, latestDraft, reviewThread, type Draft, type ReviewThread, type SignupReviewThreadPoller } from "./review-thread-poller.js";
+import { latestDraft, reviewThread, type Draft, type ReviewThread, type SignupReviewThreadPoller } from "./review-thread-poller.js";
 
 /** An agent session Flow of either harness. */
 export type ReviewSessionFlow = AgentSessionFlow<AgentFrameworkRunner<DeferredToolOutcome>>;
@@ -36,9 +36,6 @@ export interface ReviewerReply {
 export interface ReviewRecord {
   readonly thread: ReviewThread | undefined;
   readonly latestDraft: Draft | undefined;
-  readonly isFinished: boolean;
-  /** The decision approve_account or reject_account last made or tried. */
-  readonly decision: string | undefined;
 }
 
 const isMissing = (error: unknown) => error instanceof FlowNotFoundError || error instanceof FlowNotActiveOrNotFoundError;
@@ -63,11 +60,11 @@ export class ReviewSessions {
   /** The review's thread and latest draft from its poller; empty when no review post succeeded yet. */
   public async read(accountId: string): Promise<ReviewRecord> {
     try {
-      const [thread, draft, finished, decision] = await this.dex.client.getAttributes(reviewPollerId(accountId), reviewThread, latestDraft, finishedAt, agentDecision);
-      return { thread, latestDraft: draft, isFinished: finished !== undefined, decision };
+      const [thread, draft] = await this.dex.client.getAttributes(reviewPollerId(accountId), reviewThread, latestDraft);
+      return { thread, latestDraft: draft };
     } catch (error: unknown) {
       if (isMissing(error)) {
-        return { thread: undefined, latestDraft: undefined, isFinished: false, decision: undefined };
+        return { thread: undefined, latestDraft: undefined };
       }
       throw error;
     }
@@ -102,14 +99,12 @@ export class ReviewSessions {
     await this.dex.client.invokeRPC(this.dex.pollerFlow.recordDraft, reviewPollerId(accountId), draft);
   }
 
-  /** Records the decision a decision tool is about to make, so the poller does not report it as made elsewhere. */
-  public async recordDecision(accountId: string, decision: "approve" | "reject"): Promise<void> {
-    await this.dex.client.invokeRPC(this.dex.pollerFlow.recordDecision, reviewPollerId(accountId), decision);
-  }
-
-  /** Marks the review finished; a poller that already ended has nothing left to stop. */
-  public async finish(accountId: string): Promise<void> {
-    await this.dex.client.invokeRPC(this.dex.pollerFlow.finish, reviewPollerId(accountId)).catch((error: unknown) => {
+  /**
+   * Ends the review: cancels its session, which never ends on its own; the poller sees that and completes. finish_review
+   * calls it as its last act, so cancelling the session's own running tool Step loses nothing.
+   */
+  public async endSession(accountId: string, reason: string): Promise<void> {
+    await this.dex.client.stopFlow(reviewSessionId(accountId), { type: StopType.CANCEL, reason }).catch((error: unknown) => {
       if (!isMissing(error)) {
         throw error;
       }

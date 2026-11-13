@@ -72,6 +72,12 @@ export function decideNextStep(userTexts: readonly string[], seen: readonly Seen
     return follow([tool("send_welcome_email"), ...(isRefused ? [] : [tool("reply_in_thread", { text: isSent ? "Review done: approved and welcomed." : "Review done: approved; the email may not have gone out." }), tool("finish_review")])], seen);
   }
   if (userText.startsWith("[dex-cloud")) {
+    // A status its own approve or reject explains is the model's own decision: it carries on.
+    const replies = userTexts.map((text) => /^\[slack [\d.]+\] <@\w+>: ([\s\S]*)$/.exec(text)?.[1]?.trim().toLowerCase() ?? "");
+    const isOwn = userText.startsWith("[dex-cloud active]") ? replies.includes("approve") : userText.startsWith("[dex-cloud rejected]") && replies.some((text) => text.startsWith("reject "));
+    if (isOwn) {
+      return { kind: "answer", text: "That is my own decision." };
+    }
     return follow([tool("reply_in_thread", { text: "Decided in Dex Cloud admin; nothing more to do." }), tool("finish_review")], seen);
   }
   if (reply === "hold") {

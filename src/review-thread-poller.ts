@@ -55,16 +55,10 @@ export interface Draft {
 export const reviewThread = new Attribute<ReviewThread>("Thread", jsonCodec({ typeName: "ReviewThread" }));
 /** The latest posted draft: draft 1 from post_review at the start, then each post_draft through `record_draft`. */
 export const latestDraft = new Attribute<Draft>("LatestDraft", jsonCodec({ typeName: "Draft" }));
-/** When finish_review ended the review, through `finish`; the poller then stops the session once it is idle. */
-export const finishedAt = new Attribute("FinishedAt", stringCodec);
 /** The timestamp of the last reply sent to the session. Only WatchThread writes it, before it sends. */
 export const threadCursor = new Attribute("Cursor", stringCodec);
 /** The Slack page cursor of the newest thread page read; each round reads that one page. */
 export const threadPage = new Attribute("ThreadPage", stringCodec);
-/** The decision approve_account or reject_account is about to make, through `record_decision`, so the agent's own decision is not reported as one made in Dex Cloud admin. */
-export const agentDecision = new Attribute("AgentDecision", stringCodec);
-/** The account status already reported to the session as `[dex-cloud <status>]`. */
-export const reportedStatus = new Attribute("ReportedStatus", stringCodec);
 
 const heartbeatTimeoutMs = 60_000;
 /** At most the heartbeat timeout minus 10 seconds, with a round's 40 seconds included. */
@@ -121,7 +115,6 @@ function within<T>(ms: number, work: Promise<T>): Promise<T> {
 type RoundResult =
   | { readonly kind: "idle" }
   | { readonly kind: "complete"; readonly reason: string }
-  | { readonly kind: "finished" }
   | { readonly kind: "note"; readonly note: string }
   | { readonly kind: "relay"; readonly fresh: ReviewerReply[]; readonly page: string | undefined }
   | { readonly kind: "page"; readonly page: string }
@@ -181,9 +174,6 @@ class WatchThread implements Step<PollerInput> {
           break;
         case "complete":
           return gracefulComplete(result.reason);
-        case "finished":
-          await stopSession(this.settings.client(), reviewSessionId(input.accountId), "review finished");
-          return gracefulComplete("review finished");
         case "note":
           return goTo(PostWatchNote, { ...input, note: result.note });
         case "relay":
@@ -196,9 +186,9 @@ class WatchThread implements Step<PollerInput> {
           threadPage.set(context, result.page);
           return goTo(WatchThread, { accountId: input.accountId });
         case "report":
-          await this.settings.sessions.sendOnce(input.accountId, `[dex-cloud ${result.status}]`, "The account was decided in Dex Cloud admin.");
-          reportedStatus.set(context, result.status);
-          return goTo(WatchThread, { accountId: input.accountId });
+          // The marker is the status, so each status reaches the session once, whoever decided.
+          await this.settings.sessions.sendOnce(input.accountId, `[dex-cloud ${result.status}]`, `The account is ${result.status} in Dex Cloud.`);
+          break;
       }
       // Heartbeats stay well inside the heartbeat timeout, however long the pause.
       for (let slept = 0; slept < delayMs; slept += heartbeatEveryMs) {
@@ -225,18 +215,14 @@ class WatchThread implements Step<PollerInput> {
     if (session.status === "failed") {
       return { kind: "note", note: "The agent session failed, so this review stops here." };
     }
+    // finish_review ends the session; the poller ends with it.
     if (session.status !== "running") {
       return { kind: "complete", reason: "the session ended" };
     }
     if (Date.now() - session.startedAt.getTime() > this.maxReviewAgeMs) {
       return { kind: "note", note: "No decision arrived within 7 days, so this review stops here." };
     }
-    // Read from the server: finish_review's RPC may have written it since this Execute started.
-    const { isFinished, decision } = await sessions.read(input.accountId);
     const snapshot = await sessions.snapshot(input.accountId);
-    if (isFinished &&snapshot.state?.status === "waiting_for_user_message" && snapshot.queuedMessageCount === 0) {
-      return { kind: "finished" };
-    }
     if (snapshot.state?.status === "failed") {
       return { kind: "note", note: `The agent session failed (${(snapshot.state.lastTurnError ?? "no detail").slice(0, 200)}), so this review stops here.` };
     }
@@ -256,11 +242,10 @@ class WatchThread implements Step<PollerInput> {
         return { kind: "page", page: nextCursor };
       }
     }
-    if (!isFinished && round % this.accountCheckEveryRounds === 0 && reportedStatus.get(context) === undefined) {
+    if (round % this.accountCheckEveryRounds === 0) {
+      // Any decided status is reported, the agent's own decision included: the agent tells them apart.
       const account = await reviewApi.getAccount(input.accountId, AbortSignal.timeout(20_000));
-      // A status the agent's own decision explains was not made in Dex Cloud admin.
-      const isOwnDecision = (decision === "approve" && account.status === "active") || (decision === "reject" && account.status === "rejected");
-      if (account.status !== "pending_approval" && !isOwnDecision) {
+      if (account.status !== "pending_approval") {
         return { kind: "report", status: account.status };
       }
     }
@@ -354,27 +339,16 @@ export class SignupReviewThreadPoller implements Flow<PollerInput> {
   }
 
   public getPersistenceSchema(): PersistenceSchema {
-    return { attributes: [reviewThread, latestDraft, finishedAt, threadCursor, threadPage, agentDecision, reportedStatus] };
+    return { attributes: [reviewThread, latestDraft, threadCursor, threadPage] };
   }
 
-  /** post_draft records the draft it posted, so send_welcome_email sends what the reviewers saw. Only this RPC writes it after the start. */
+  /**
+   * post_draft records the draft it posted, so send_welcome_email sends what the reviewers saw. After the start only
+   * this RPC writes it, and WatchThread never does, so it needs no lock.
+   */
   public recordDraft(context: Context, draft: Draft): void {
     latestDraft.set(context, draft);
-  }
-
-  /** approve_account and reject_account record their decision before they make it; only this RPC writes it. */
-  public recordDecision(context: Context, decision: string): void {
-    agentDecision.set(context, decision);
-  }
-
-  /** finish_review marks the review finished; only this RPC writes it. */
-  public finish(context: Context): void {
-    if (finishedAt.get(context) === undefined) {
-      finishedAt.set(context, new Date().toISOString());
-    }
   }
 }
 
 declareRPCMethod(SignupReviewThreadPoller, "recordDraft", { name: "record_draft" });
-declareRPCMethod(SignupReviewThreadPoller, "recordDecision", { name: "record_decision" });
-declareRPCMethod(SignupReviewThreadPoller, "finish", { name: "finish" });
