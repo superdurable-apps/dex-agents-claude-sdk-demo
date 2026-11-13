@@ -32,6 +32,8 @@ export class ReviewApiTestStub {
   private readonly accounts = new Map<string, StoredAccount>();
   /** Operations whose next call is applied but answered with a 503, as a lost response would look. */
   private readonly failAfterApplying = new Set<string>();
+  /** Operations whose next call is refused with `failed_precondition` and not applied. */
+  private readonly refuseNextCall = new Set<string>();
   /** As the server does until it can leave the platform's approval mail out: refuse `suppressApprovedMail: true`. */
   public refusesSuppressedMail = false;
   /** Gets answered with a 503 before the next one succeeds. */
@@ -77,6 +79,11 @@ export class ReviewApiTestStub {
   /** Applies the next `operation` call, then answers 503 instead of the result. */
   public failNextResponse(operation: "approve" | "reject"): void {
     this.failAfterApplying.add(operation);
+  }
+
+  /** Refuses the next `operation` call with `failed_precondition`, applying nothing. */
+  public refuseNext(operation: "approve" | "reject"): void {
+    this.refuseNextCall.add(operation);
   }
 
   public accountOf(accountId: string): Account | undefined {
@@ -131,6 +138,10 @@ export class ReviewApiTestStub {
     const fingerprint = JSON.stringify([operation, input.accountId, input.requestId, input.expectedRevision, input.suppressApprovedMail ?? false]);
     if (stored.lastDecision?.fingerprint === fingerprint) {
       send(response, 200, { account: stored.lastDecision.account });
+      return;
+    }
+    if (this.refuseNextCall.delete(operation)) {
+      send(response, 409, { error: { code: "failed_precondition", message: "the account is locked" } });
       return;
     }
     if (operation === "approve" && input.suppressApprovedMail === true && this.refusesSuppressedMail) {

@@ -23,7 +23,7 @@ export interface SignupAgentConfig {
   /** Only sign-ups registered at or after this time are reviewed. */
   readonly reviewSince: Date;
   readonly threadPollIntervalMs: number;
-  /** The Worker's execution slots: each open review's ledger holds one while it polls. */
+  /** The Worker's execution slots: each open review's poller holds one while it polls. */
   readonly workerSlots: number;
 }
 
