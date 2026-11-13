@@ -36,6 +36,10 @@ registerSignupReviewScenarios({
   },
   close: async () => {
     assert.deepEqual(messagesApi.unservedRequests, []);
+    // The CLI offers the agent's own tools only: no Claude Code built-in tool, such as Bash or Read. The placeholder
+    // stands in for a deferred call while the CLI resumes it; it runs nothing.
+    const offered = [...messagesApi.offeredTools].filter((name) => name !== "DeferredToolPlaceholder").map((name) => name.split("__").at(-1)).sort();
+    assert.deepEqual(offered, ["approve_account", "fetch_profile", "finish_review", "github_user", "post_draft", "post_review", "reject_account", "reply_in_thread", "send_welcome_email"]);
     await messagesApi.stop();
     rmSync(stateDirectory, { recursive: true, force: true });
   },

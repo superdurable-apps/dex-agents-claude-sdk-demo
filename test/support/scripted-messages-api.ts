@@ -15,6 +15,8 @@ const resumePromptText = "Continue from where you left off.";
 
 export class ScriptedMessagesApi {
   public readonly unservedRequests: string[] = [];
+  /** Every tool name a model request offered, as the CLI named it. */
+  public readonly offeredTools = new Set<string>();
 
   private constructor(private readonly server: Server) {}
 
@@ -50,6 +52,7 @@ export class ScriptedMessagesApi {
     }
     const payload = JSON.parse(body) as JsonObject;
     const toolNames = ((payload.tools as JsonObject[] | undefined) ?? []).map((tool) => String(tool.name));
+    toolNames.forEach((name) => this.offeredTools.add(name));
     const blocks = reply((payload.messages as JsonObject[] | undefined) ?? [], toolNames);
     const model = String(payload.model ?? "claude-scripted");
     if (payload.stream === true) {
@@ -62,7 +65,7 @@ export class ScriptedMessagesApi {
 
 function reply(messages: readonly JsonObject[], toolNames: readonly string[]): ContentBlock[] {
   let commandIndex = -1;
-  let userText = "";
+  const userTexts: string[] = [];
   messages.forEach((entry, index) => {
     if (entry.role !== "user") {
       return;
@@ -73,7 +76,7 @@ function reply(messages: readonly JsonObject[], toolNames: readonly string[]): C
       .filter((text) => text !== "" && text !== resumePromptText);
     if (texts.length > 0) {
       commandIndex = index;
-      userText = texts.at(-1) ?? "";
+      userTexts.push(...texts);
     }
   });
   if (commandIndex < 0) {
@@ -88,7 +91,7 @@ function reply(messages: readonly JsonObject[], toolNames: readonly string[]): C
       seen.push({ name: names.get(String(block.tool_use_id))!, output: resultText(block.content) });
     }
   }
-  const step = decideNextStep(userText, seen);
+  const step = decideNextStep(userTexts, seen);
   if (step.kind === "answer") {
     return [{ type: "text", text: step.text }];
   }
