@@ -7,6 +7,7 @@ import {
   readAgentSnapshot,
   sendAgentUserMessage,
   toolCallNotRunErrorPrefix,
+  turnFailureNoteHeader,
   type AgentFrameworkRunner,
   type AgentMessage,
   type AgentSessionFlow,
@@ -47,7 +48,7 @@ export interface Draft {
 
 type Outcome = "running" | "succeeded" | "refused" | "unknown";
 
-/** One tool call of the session, with its outcome and the time of the model response that asked for it. */
+/** One tool call of the session, with its outcome and the start time of the turn that asked for it. */
 export interface ToolCallFact {
   readonly id: string;
   readonly name: string;
@@ -98,7 +99,9 @@ function outcomeOf(resultText: string, isSuccess: boolean): Outcome {
     detail.startsWith(refusedPrefix) ||
     detail.startsWith(notSentPrefix) ||
     detail.startsWith(toolCallNotRunErrorPrefix) ||
-    ["gmail sendMessage", "slack postThreadReply", "slack postChannelMessage"].some((operation) => detail.startsWith(`${operation} ${connectorNotSentRetryLater}`));
+    ["gmail sendMessage", "slack postThreadReply", "slack postChannelMessage"].some((operation) => detail.startsWith(`${operation} ${connectorNotSentRetryLater}`)) ||
+    // The Claude Code CLI runs one deferred call per turn segment and denies the others before they run.
+    /^\S+ did not run(\. It must run outside this turn|: its permission check failed)/.test(detail);
   return isNotRun ? "refused" : "unknown";
 }
 
@@ -124,12 +127,18 @@ function callsIn(message: AgentMessage): { id: string; name: string }[] {
 }
 
 /**
- * Every tool call of the session, in order. A call without a result that the active turn does not hold either, such
+ * Every tool call of the session, in order: from each stored model response, from the active turn's records, and from
+ * the notes a failed turn leaves, whose transcript a harness may not keep. A call without a recorded outcome, such
  * as one of a failed turn, counts as unknown: it may have run.
  */
 function toolCallsOf(messages: readonly AgentMessage[], snapshot: AgentSnapshot): ToolCallFact[] {
   const results = new Map(messages.filter((message) => message.role === "tool" && message.toolCallId !== null).map((message) => [message.toolCallId!, message.toolOutput ?? ""]));
   const active = new Map(snapshot.toolCalls.map((record) => [record.toolCallId, record]));
+  const turnStarts = new Map<string, string>();
+  for (const message of messages.filter((candidate) => candidate.role === "user")) {
+    turnStarts.set(message.turnId, turnStarts.get(message.turnId) ?? message.createdAt);
+  }
+  const startOf = (turnId: string) => turnStarts.get(turnId) ?? messages[0]?.createdAt ?? new Date(0).toISOString();
   const facts = new Map<string, ToolCallFact>();
   const add = (id: string, name: string, askedAt: string) => {
     const resultText = results.get(id);
@@ -154,13 +163,27 @@ function toolCallsOf(messages: readonly AgentMessage[], snapshot: AgentSnapshot)
     }
     facts.set(id, { id, name, outcome, output, resultText: resultText ?? record?.output ?? record?.error ?? undefined, askedAt });
   };
-  for (const message of messages.filter((candidate) => candidate.role === "assistant")) {
-    for (const call of callsIn(message)) {
-      add(call.id, call.name, message.createdAt);
+  for (const message of messages) {
+    if (message.role === "assistant") {
+      for (const call of callsIn(message)) {
+        add(call.id, call.name, startOf(message.turnId));
+      }
+    } else if (message.role === "user" && message.origin === "turn_failure_note" && (message.text ?? "").startsWith(turnFailureNoteHeader)) {
+      // Lines `- <tool> <arguments> -> <status>: <outcome>`; calls already known from their response are skipped.
+      (message.text ?? "").split("\n").forEach((line, index) => {
+        const match = /^- (\S+) [\s\S]* -> (\w+): ([\s\S]*)$/.exec(line);
+        const name = match?.[1]?.split("__").at(-1);
+        if (match === null || name === undefined || [...facts.values()].some((fact) => fact.name === name && fact.askedAt === startOf(message.turnId))) {
+          return;
+        }
+        const output = match[2] === "succeeded" ? parseObject(match[3]) : undefined;
+        const outcome: Outcome = match[2] === "succeeded" ? "succeeded" : match[2] === "failed" ? outcomeOf(match[3] ?? "", false) : "unknown";
+        facts.set(`${message.sequence}-${index}`, { id: `${message.sequence}-${index}`, name, outcome, output, resultText: match[3], askedAt: startOf(message.turnId) });
+      });
     }
   }
   for (const record of snapshot.toolCalls.filter((candidate) => !facts.has(candidate.toolCallId))) {
-    add(record.toolCallId, record.toolName.split("__").at(-1) ?? record.toolName, new Date().toISOString());
+    add(record.toolCallId, record.toolName.split("__").at(-1) ?? record.toolName, startOf(record.turnId));
   }
   return [...facts.values()];
 }
