@@ -17,7 +17,18 @@ export interface SignupAgentConfig {
   readonly claudeModel: string;
   readonly githubToken: string | undefined;
   readonly watchIntervalMs: number;
+  /** Only sign-ups registered at or after this time are reviewed. */
+  readonly reviewSince: Date;
   readonly threadPollIntervalMs: number;
+}
+
+/** SIGNUP_REVIEW_SINCE is required, so a first start never reviews the whole backlog of pending sign-ups. */
+function reviewSince(value: string): Date {
+  const since = new Date(value);
+  if (!/^\d{4}-\d{2}-\d{2}T/.test(value) || Number.isNaN(since.getTime())) {
+    throw new Error(`SIGNUP_REVIEW_SINCE must be an RFC 3339 time, such as ${new Date().toISOString()}`);
+  }
+  return since;
 }
 
 function positiveInteger(value: string, name: string): number {
@@ -43,6 +54,7 @@ export function loadSignupAgentConfig(environment: NodeJS.ProcessEnv = process.e
       blobCacheDirectory: optional("DEX_BLOB_CACHE_DIR") ?? ".dex-blob-cache",
     },
     reviewApiUrl: required("REVIEW_API_URL"),
+    reviewSince: reviewSince(required("SIGNUP_REVIEW_SINCE")),
     reviewApiKey: required("REVIEW_API_KEY"),
     slackChannelId: required("SLACK_REVIEW_CHANNEL"),
     reviewerSlackIds: new Set(required("SIGNUP_REVIEWER_SLACK_IDS").split(",").map((id) => id.trim()).filter(Boolean)),

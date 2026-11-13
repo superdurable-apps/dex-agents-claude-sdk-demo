@@ -24,6 +24,7 @@ Procedure:
 4. Admins' replies arrive as messages "[slack <ts>] <@user>: <text>". Act on each:
    - "approve": call approve_account. "reject <reason>": call reject_account.
    - "send", after the account is approved: call send_welcome_email. It sends the latest posted draft. If it fails in any way other than a refusal, never call it again: say in the thread that the email may have been sent and to check Sent Mail, then finish.
+   - "hold": do nothing until the next reply; it cancels a pending decision or send.
    - Anything else is feedback on the email: write a new draft and call post_draft.
    - Messages "[dex-cloud ...]" tell you the account was decided in Dex Cloud admin: say so with reply_in_thread and finish.
    A tool that refuses tells you why; explain it briefly with reply_in_thread when it helps the admins. Be concise.
@@ -72,23 +73,32 @@ export function createSignupTools(services: SignupServices): SignupTool[] {
    */
   async function decide(sessionId: string, decision: "approve" | "reject", signal: AbortSignal) {
     const state = await services.sessions.read(sessionId);
-    if (state.decision !== decision) {
-      refuse(`the latest reviewer decision in the thread is ${state.decision === undefined ? "none" : `\`${state.decision}\``}`);
-    }
     const target = decision === "approve" ? "active" : "rejected";
     let account = await services.reviewApi.getAccount(accountIdOf(sessionId), signal);
+    if (state.decision !== decision) {
+      // A retry may find its own earlier call applied after the reviewers changed their mind: say what happened.
+      const wasAsked = state.replies.some((reply) => (decision === "approve" ? /^approve$/i : /^reject\s+\S/i).test(reply.text));
+      if (wasAsked && account.status === target) {
+        return { status: decision === "approve" ? "approved" : "rejected", note: `the account is already ${account.status}; a reviewer replied otherwise since, so tell them` };
+      }
+      refuse(`the latest reviewer decision in the thread is ${state.decision === undefined ? "none" : `\`${state.decision}\``}`);
+    }
     if (account.status === "pending_approval") {
       const request = { accountId: account.accountId, requestId: `${sessionId}-${decision}`, expectedRevision: account.revision };
       try {
         account =
           decision === "approve"
-            ? await services.reviewApi.approveAccount({ ...request, suppressApprovedMail: true }, signal)
+            ? // The platform's own approval mail is left out once the ReviewAPI supports it; until then it refuses this.
+              await services.reviewApi.approveAccount({ ...request, suppressApprovedMail: true }, signal)
             : await services.reviewApi.rejectAccount(request, signal);
       } catch (error: unknown) {
-        if (!(error instanceof ReviewApiError && error.code === "revision_conflict")) {
+        if (!(error instanceof ReviewApiError) || (error.code !== "revision_conflict" && error.code !== "failed_precondition")) {
           throw error;
         }
         account = error.currentAccount ?? (await services.reviewApi.getAccount(account.accountId, signal));
+        if (error.code === "failed_precondition" && account.status !== target) {
+          refuse(`the review API refused the decision: ${error.message}`);
+        }
       }
     }
     if (account.status === target) {
@@ -146,37 +156,47 @@ export function createSignupTools(services: SignupServices): SignupTool[] {
   ];
 }
 
+/** What a guard decides: the operation's input and facts to add to its result, or an earlier call's result. */
+type GuardDecision<Input, Output> = { readonly input: Input; readonly describe?: Record<string, unknown> } | { readonly alreadyDone: Output };
+
 /**
  * A connector operation whose input the guard builds from the tool's arguments and the session's state. The call
- * identity, the dispatch fence and the retry rules stay the connector's own: the guard only runs first.
+ * identity, the dispatch fence and the retry rules stay the connector's own: the guard only runs first. A sent result
+ * carries the guard's facts, such as the draft, so the session's record of the call describes itself.
  */
 function guarded<Input, Output>(
   operation: Mutation<Input, Output>,
-  guard: (args: Record<string, unknown>, sessionId: string, call: Call) => Promise<Input | { readonly alreadyDone: Output }>,
+  guard: (args: Record<string, unknown>, sessionId: string, call: Call) => Promise<GuardDecision<Input, Output>>,
 ): Mutation<Record<string, unknown>, Output> {
   return {
     definition: () => operation.definition(),
     idempotencyKey: (callId) => operation.idempotencyKey(callId, undefined as Input),
     invoke: async (call, args) => {
-      let input: Input | { readonly alreadyDone: Output };
+      let decision: GuardDecision<Input, Output>;
       try {
-        input = await guard(args, call.context.flowId, call);
+        decision = await guard(args, call.context.flowId, call);
       } catch (error: unknown) {
         // Nothing was sent yet, so any guard failure is a definite failure the model reads.
         throw error instanceof ToolExecutionError ? error : new ToolExecutionError(`${notSentPrefix}${error instanceof Error ? error.message.slice(0, 300) : String(error)}`);
       }
-      // An earlier call whose outcome was unknown turned out to have done it: answer as that call would have.
-      return typeof input === "object" && input !== null && "alreadyDone" in input ? newMutationBranch("sent", input.alreadyDone) : operation.invoke(call, input as Input);
+      if ("alreadyDone" in decision) {
+        // An earlier call whose outcome was unknown turned out to have done it: answer as that call would have.
+        return newMutationBranch("sent", decision.alreadyDone);
+      }
+      const attempt = await operation.invoke(call, decision.input);
+      return attempt.kind === "branch" && attempt.branch === "sent" && decision.describe !== undefined
+        ? { ...attempt, value: { ...attempt.value, ...decision.describe } }
+        : attempt;
     },
   };
 }
 
 /**
- * Looks for the review post that an earlier, unconfirmed post_review may have made: the app's own channel message
- * since the session started whose text holds the session's footer. Slack may allow one history read per minute,
- * so only this reconciliation reads channel history.
+ * Looks for the review post that an earlier, unconfirmed post_review may have made: the app's own channel message,
+ * since that call, whose last line is the review's footer. Slack may allow one history read per minute, so only this
+ * reconciliation reads channel history, and one page of it.
  */
-async function findOwnReviewPost(services: SignupServices, call: Call, sessionId: string, startedAt: string) {
+async function findOwnReviewPost(services: SignupServices, call: Call, footer: string, since: string) {
   const { slack, slackChannelId } = services;
   const query = <Input, Output>(operation: Query<Input, Output>, input: Input) =>
     runQuery(operation, createCall(call.context, slack.reference, operation.definition().operation), input);
@@ -184,30 +204,18 @@ async function findOwnReviewPost(services: SignupServices, call: Call, sessionId
   if (identity.branch !== "read") {
     throw new Error(`reading the Slack app's identity ended ${identity.branch}`);
   }
-  const marker = reviewFooterMarker(sessionId);
-  const oldestTimestamp = `${Math.floor(Date.parse(startedAt) / 1000) - 60}.000000`;
-  let cursor: string | undefined;
-  for (let page = 0; page < 3; page++) {
-    const result = await query(slack.operations.listChannelMessages(), { channelId: slackChannelId, oldestTimestamp, pageSize: 15, ...(cursor ? { cursor } : {}) });
-    if (result.branch !== "read") {
-      throw new Error(`reading the Slack channel ended ${result.branch}`);
-    }
-    const own = (result.value.messages ?? []).find(
-      (message) => (message.botId === identity.value.botId || message.userId === identity.value.botUserId) && message.text.includes(marker),
-    );
-    if (own !== undefined) {
-      return { message: { channelId: own.channelId, timestamp: own.timestamp, userId: own.userId ?? identity.value.botUserId, text: own.text } };
-    }
-    cursor = result.value.nextCursor;
-    if (!cursor) {
-      break;
-    }
+  const oldestTimestamp = `${Math.floor(Date.parse(since) / 1000) - 5}.000000`;
+  const page = await query(slack.operations.listChannelMessages(), { channelId: slackChannelId, oldestTimestamp, pageSize: 15 });
+  if (page.branch !== "read") {
+    throw new Error(`reading the Slack channel ended ${page.branch}`);
   }
-  return undefined;
+  return (page.value.messages ?? []).find(
+    (message) => (message.botId === identity.value.botId || message.userId === identity.value.botUserId) && message.text.split("\n").at(-1) === footer,
+  );
 }
 
-/** The footer text that identifies a review post. */
-const reviewFooterMarker = (sessionId: string) => `Dex session \`${sessionId}\``;
+/** The last line of a review post, which identifies it. */
+const reviewFooter = (harness: string, sessionId: string) => `_Reviewed by ${escapeSlack(harness)} · Dex session \`${sessionId}\`_`;
 
 /** The package manifest entry of `operationId`, offered under the tool's own arguments and description. */
 function manifestFor(manifest: ConnectorPackageManifest, operationId: string, description: string, schema: z.ZodObject): ConnectorPackageManifest {
@@ -233,25 +241,33 @@ export function createSignupConnectorTools(services: SignupServices): ToolSource
     if (state.thread !== undefined) {
       refuse(`the review is already posted (thread ${state.thread.ts}); use post_draft or reply_in_thread`);
     }
-    if (state.hasUnconfirmedReviewPost) {
-      const found = await findOwnReviewPost(services, call, sessionId, state.startedAt);
+    const review = reviewSchema.parse(args);
+    const account = await services.reviewApi.getAccount(accountIdOf(sessionId), call.context.cancellationSignal);
+    const text = reviewPost(account, review, services.harnessLabel, sessionId);
+    const draft = { number: 1, subject: review.emailSubject, body: review.emailBody };
+    if (state.unconfirmedReviewPostAt !== undefined) {
+      const found = await findOwnReviewPost(services, call, reviewFooter(services.harnessLabel, sessionId), state.unconfirmedReviewPostAt);
       if (found !== undefined) {
-        return { alreadyDone: found };
+        const message = { channelId: found.channelId, timestamp: found.timestamp, userId: found.userId ?? "", text: found.text };
+        // The earlier post shows its own draft: adopt the thread, and the draft only when it is this one.
+        return found.text === text
+          ? { alreadyDone: { message, draft } }
+          : { alreadyDone: { message, draft: null, note: "an earlier attempt posted the review with another draft; post this draft with post_draft" } };
       }
     }
-    const account = await services.reviewApi.getAccount(accountIdOf(sessionId), call.context.cancellationSignal);
-    return { channelId: services.slackChannelId, text: reviewPost(account, reviewSchema.parse(args), services.harnessLabel, sessionId) };
+    return { input: { channelId: services.slackChannelId, text }, describe: { draft } };
   });
   const postDraft = guarded(slack.operations.postThreadReply(), async (args, sessionId) => {
     const state = await sessions.read(sessionId);
     const thread = requireThread(state);
     const draft = draftSchema.parse(args);
-    const text = `*[draft ${state.draftAttempts + 1}]*\n${emailBlock(draft.subject, draft.body)}\nReply \`send\` to send this draft once the account is approved, or write what to change.`;
-    return { channelId: thread.channel, threadTimestamp: thread.ts, text };
+    const number = state.draftAttempts + 1;
+    const text = `*[draft ${number}]*\n${emailBlock(draft.subject, draft.body)}\nReply \`send\` to send this draft once the account is approved, or write what to change.`;
+    return { input: { channelId: thread.channel, threadTimestamp: thread.ts, text }, describe: { draft: { number, ...draft } } };
   });
   const replyInThread = guarded(slack.operations.postThreadReply(), async (args, sessionId) => {
     const thread = requireThread(await sessions.read(sessionId));
-    return { channelId: thread.channel, threadTimestamp: thread.ts, text: escapeSlack(replySchema.parse(args).text) };
+    return { input: { channelId: thread.channel, threadTimestamp: thread.ts, text: escapeSlack(replySchema.parse(args).text) } };
   });
   const sendWelcomeEmail = guarded(gmail.operations.sendMessage(), async (_args, sessionId, call) => {
     const signal = call.context.cancellationSignal;
@@ -267,10 +283,12 @@ export function createSignupConnectorTools(services: SignupServices): ToolSource
     if (state.hasUnconfirmedNewerDraft) {
       refuse("a newer draft may have been posted without a confirmation; post the draft again with post_draft");
     }
-    if (!state.replies.some((reply) => /^send$/i.test(reply.text) && isLater(reply.ts, draft.ts))) {
-      refuse("no reviewer has replied `send` after the latest draft");
+    // `send` counts only as the latest reviewer reply, after the draft: any later reply, such as `hold`, cancels it.
+    const latest = state.replies.at(-1);
+    if (latest === undefined || !/^send$/i.test(latest.text) || !isLater(latest.ts, draft.ts)) {
+      refuse("the latest reviewer reply after the latest draft is not `send`");
     }
-    return { to: [account.email], subject: draft.subject, textBody: draft.body };
+    return { input: { to: [account.email], subject: draft.subject, textBody: draft.body }, describe: { draft: { number: draft.number } } };
   });
 
   const slackTool = (name: string, operationId: string, description: string, schema: z.ZodObject, operation: Mutation<Record<string, unknown>, unknown>) =>
@@ -285,8 +303,7 @@ export function createSignupConnectorTools(services: SignupServices): ToolSource
     slackTool("post_draft", "postThreadReply", "Post a new welcome email draft in the review thread.", draftSchema, postDraft),
     slackTool("reply_in_thread", "postThreadReply", "Post a short note in the review thread.", replySchema, replyInThread),
     connectorTool(sendWelcomeEmail, gmail.reference, {
-      // The Gmail package builds on Connector SDK 0.6; its manifest and operations have the shape 0.9 reads.
-      manifest: manifestFor(gmailManifest as ConnectorPackageManifest, "sendMessage", "Send the latest posted draft to the applicant. Allowed once, after the approval and a reviewer's `send`.", z.object({})),
+      manifest: manifestFor(gmailManifest, "sendMessage", "Send the latest posted draft to the applicant. Allowed once, after the approval and a reviewer's `send`.", z.object({})),
       inputValidator: z.object({}),
       name: "send_welcome_email",
       requiresApproval: false,
@@ -296,7 +313,8 @@ export function createSignupConnectorTools(services: SignupServices): ToolSource
 
 /** Escapes Slack mrkdwn control characters, so applicant and model text shows as written and cannot mention anyone. */
 export const escapeSlack = (text: string): string => text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-const oneLine = (text: string | undefined, fallback: string): string => escapeSlack((text ?? fallback).replace(/\s+/g, " ").trim().slice(0, 300) || fallback);
+const oneLine = (text: string | null | undefined, fallback: string): string =>
+  escapeSlack((text ?? fallback).replace(/\s+/g, " ").replace(/[`*_~]/g, "'").trim().slice(0, 300) || fallback);
 
 /** The email exactly as it would be sent, in a code block. */
 function emailBlock(subject: string, body: string): string {
@@ -311,8 +329,8 @@ function reviewPost(account: Account, review: { recommendation: string; reasons:
     ...review.reasons.map((reason) => `• ${oneLine(reason, "")}`),
     "*[draft 1]*",
     emailBlock(review.emailSubject, review.emailBody),
-    "*Reply in this thread:* `approve`, `reject <reason>`, or what to change in the email; after the approval, `send`.",
-    `_Reviewed by ${harness} · ${reviewFooterMarker(sessionId)}_`,
+    "*Reply in this thread:* `approve`, `reject <reason>`, `hold`, or what to change in the email; after the approval, `send`.",
+    reviewFooter(harness, sessionId),
   ].join("\n");
 }
 

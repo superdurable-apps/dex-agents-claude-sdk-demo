@@ -22,8 +22,7 @@ const services: SignupServices = {
   reviewApi: new ReviewApiClient({ baseUrl: config.reviewApiUrl, apiKey: config.reviewApiKey }),
   profiles: new PublicProfileSources(config.githubToken === undefined ? {} : { githubToken: config.githubToken }),
   slack: newSlackConnection(project, "review-slack"),
-  // The Gmail package builds on its own copy of the Connector SDK; the loaded project has the same shape.
-  gmail: newGmailConnection(project as unknown as Parameters<typeof newGmailConnection>[0], "welcome-gmail"),
+  gmail: newGmailConnection(project, "welcome-gmail"),
   slackChannelId: config.slackChannelId,
   harnessLabel: piHarnessLabel,
 };
@@ -47,7 +46,11 @@ await worker.waitPullRegistered({ timeoutMs: 30_000 });
 console.log(`Signup review agent (${sessionFlow.getFlowType()}) is running on ${config.dex.options.serverAddress}`);
 
 const stopping = new AbortController();
-const watching = runSignupWatcher({ client, sessionFlow, threadWatchFlow, reviewApi: services.reviewApi }, config.watchIntervalMs, stopping.signal);
+const watching = runSignupWatcher(
+  { client, sessionFlow, threadWatchFlow, reviewApi: services.reviewApi, reviewSince: config.reviewSince },
+  config.watchIntervalMs,
+  stopping.signal,
+);
 for (const signal of ["SIGINT", "SIGTERM"] as const) {
   process.once(signal, () => {
     console.log("Stopping; the reviews wait in Dex and go on when the agent starts again");

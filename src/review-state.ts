@@ -1,8 +1,8 @@
-// What a review session has done so far, read from its own Dex state: the facts every guard decides from.
-// Reviewer replies are the `[slack <ts>] <@user>: text` user messages that the thread-watch Flow sends; tool output
-// is never a user message, so nothing a tool returns can pass for a reviewer.
+// What a review has done so far, read from Dex state: the facts every guard decides from.
+// The reviewers' replies come only from the thread-watch Flow's RelayedReplies Attribute: a message that someone sends
+// to the session, or text in a tool result, never counts as a reviewer's reply.
 
-import type { Client } from "@superdurable/dex";
+import { Attribute, FlowNotActiveOrNotFoundError, jsonCodec, stringCodec, type Client } from "@superdurable/dex";
 import {
   readAgentSnapshot,
   sendAgentUserMessage,
@@ -19,18 +19,12 @@ import { connectorNotSentRetryLater } from "@superdurable/dex-agents/connectors"
 export type ReviewSessionFlow = AgentSessionFlow<AgentFrameworkRunner<DeferredToolOutcome>>;
 
 export const reviewSessionId = (accountId: string): string => `signup-review-${accountId}`;
+export const threadWatchFlowId = (accountId: string): string => `signup-review-${accountId}-thread`;
 export const accountIdOf = (sessionId: string): string => sessionId.replace(/^signup-review-/, "");
 
 /** Prefixes of the tools' own failures that prove nothing was sent. */
 export const refusedPrefix = "refused: ";
 export const notSentPrefix = "not sent: ";
-
-export interface Draft {
-  readonly subject: string;
-  readonly body: string;
-  /** Slack timestamp of the post that showed this draft. */
-  readonly ts: string;
-}
 
 export interface ReviewerReply {
   readonly ts: string;
@@ -38,39 +32,51 @@ export interface ReviewerReply {
   readonly text: string;
 }
 
-/** The facts of one review session. */
-export interface ReviewState {
-  readonly snapshot: AgentSnapshot;
-  /** When the session started, from its first message (RFC 3339). */
-  readonly startedAt: string;
-  /** Whether an earlier post_review may have posted without a confirmation. */
-  readonly hasUnconfirmedReviewPost: boolean;
-  /** The review's Slack thread, once post_review succeeded, and the bot user that posted it. */
-  readonly thread?: { readonly channel: string; readonly ts: string; readonly botUserId: string | undefined };
-  /** The newest draft whose post succeeded; draft 1 is in the review post. */
-  readonly latestDraft?: Draft;
-  /** Drafts whose post may have gone out: the review post and every post_draft that got past its guard. */
-  readonly draftAttempts: number;
-  /** Whether a post_draft newer than the latest draft may have been posted without a confirmation. */
-  readonly hasUnconfirmedNewerDraft: boolean;
-  /** The reviewers' replies relayed so far, oldest first. */
-  readonly replies: readonly ReviewerReply[];
-  /** The latest reply that is a decision: exactly `approve`, or `reject <reason>`. */
-  readonly decision?: "approve" | "reject";
-  readonly isApprovedHere: boolean;
-  readonly isRejectedHere: boolean;
-  /** Whether send_welcome_email ever got past its guard, whatever its outcome: it never runs twice. */
-  readonly hasSendAttempt: boolean;
-  readonly isFinished: boolean;
+/** Thread-watch Flow state: every reviewer reply it relayed, oldest first, recorded before it is forwarded. */
+export const relayedReplies = new Attribute<ReviewerReply[]>("RelayedReplies", jsonCodec({ typeName: "ReviewerReplies" }));
+/** Thread-watch Flow state: the timestamp of the last relayed reply. */
+export const threadCursor = new Attribute("Cursor", stringCodec);
+
+/** A draft as the post that showed it describes it: the write tools return self-describing outputs. */
+export interface Draft {
+  readonly number: number;
+  readonly subject: string;
+  readonly body: string;
+  readonly ts: string;
 }
 
 type Outcome = "running" | "succeeded" | "refused" | "unknown";
 
-interface ToolCallFact {
+/** One tool call of the session, with its outcome and the time of the model response that asked for it. */
+export interface ToolCallFact {
+  readonly id: string;
   readonly name: string;
-  readonly arguments: Record<string, unknown>;
-  readonly output: Record<string, unknown> | undefined;
   readonly outcome: Outcome;
+  readonly output: Record<string, unknown> | undefined;
+  readonly resultText: string | undefined;
+  readonly askedAt: string;
+}
+
+/** The facts of one review. */
+export interface ReviewState {
+  readonly snapshot: AgentSnapshot;
+  readonly calls: readonly ToolCallFact[];
+  /** The review's Slack thread, once post_review succeeded, and the bot user that posted it. */
+  readonly thread?: { readonly channel: string; readonly ts: string; readonly botUserId: string | undefined };
+  /** The newest draft whose post succeeded. */
+  readonly latestDraft?: Draft;
+  /** Drafts whose post may have gone out, the review post included. */
+  readonly draftAttempts: number;
+  readonly hasUnconfirmedNewerDraft: boolean;
+  /** The model response time of an earlier post_review that may have posted without a confirmation. */
+  readonly unconfirmedReviewPostAt?: string;
+  readonly replies: readonly ReviewerReply[];
+  /** The latest reply that decides: exactly `approve`, `reject <reason>`, or `hold`, which cancels both. */
+  readonly decision?: "approve" | "reject";
+  readonly isApprovedHere: boolean;
+  readonly isRejectedHere: boolean;
+  readonly hasSendAttempt: boolean;
+  readonly isFinished: boolean;
 }
 
 function parseObject(text: string | null | undefined): Record<string, unknown> | undefined {
@@ -83,7 +89,7 @@ function parseObject(text: string | null | undefined): Record<string, unknown> |
 }
 
 /** A finished call's outcome from its result text: our refusals and the SDK's not-run notes prove nothing ran. */
-function outcomeOf(name: string, resultText: string, isSuccess: boolean): Outcome {
+function outcomeOf(resultText: string, isSuccess: boolean): Outcome {
   if (isSuccess) {
     return "succeeded";
   }
@@ -92,48 +98,74 @@ function outcomeOf(name: string, resultText: string, isSuccess: boolean): Outcom
     detail.startsWith(refusedPrefix) ||
     detail.startsWith(notSentPrefix) ||
     detail.startsWith(toolCallNotRunErrorPrefix) ||
-    (name === "send_welcome_email" && detail.startsWith(`gmail sendMessage ${connectorNotSentRetryLater}`)) ||
-    detail.startsWith(`slack postThreadReply ${connectorNotSentRetryLater}`) ||
-    detail.startsWith(`slack postChannelMessage ${connectorNotSentRetryLater}`);
+    ["gmail sendMessage", "slack postThreadReply", "slack postChannelMessage"].some((operation) => detail.startsWith(`${operation} ${connectorNotSentRetryLater}`));
   return isNotRun ? "refused" : "unknown";
 }
 
-/** Every tool call: from the stored messages of finished turns, then the active turn's call records. */
+/** Every tool call a stored model response asked for, found in its framework item: pi-ai `toolCall` and Claude `tool_use` parts. */
+function callsIn(message: AgentMessage): { id: string; name: string }[] {
+  const found = new Map<string, string>();
+  const visit = (node: unknown): void => {
+    if (Array.isArray(node)) {
+      node.forEach(visit);
+    } else if (typeof node === "object" && node !== null) {
+      const record = node as Record<string, unknown>;
+      if ((record.type === "toolCall" || record.type === "tool_use") && typeof record.id === "string" && typeof record.name === "string") {
+        found.set(record.id, record.name);
+      }
+      Object.values(record).forEach(visit);
+    }
+  };
+  visit(parseObject(message.frameworkItem));
+  if (message.toolCallId !== null && message.toolName !== null) {
+    found.set(message.toolCallId, message.toolName);
+  }
+  return [...found].map(([id, name]) => ({ id, name: name.split("__").at(-1) ?? name }));
+}
+
+/**
+ * Every tool call of the session, in order. A call without a result that the active turn does not hold either, such
+ * as one of a failed turn, counts as unknown: it may have run.
+ */
 function toolCallsOf(messages: readonly AgentMessage[], snapshot: AgentSnapshot): ToolCallFact[] {
-  const bareName = (name: string) => name.split("__").at(-1) ?? name;
-  const results = new Map(messages.filter((message) => message.role === "tool").map((message) => [message.toolCallId, message.toolOutput]));
+  const results = new Map(messages.filter((message) => message.role === "tool" && message.toolCallId !== null).map((message) => [message.toolCallId!, message.toolOutput ?? ""]));
+  const active = new Map(snapshot.toolCalls.map((record) => [record.toolCallId, record]));
   const facts = new Map<string, ToolCallFact>();
-  for (const message of messages) {
-    if (message.role === "assistant" && message.toolName !== null && message.toolCallId !== null) {
-      const resultText = results.get(message.toolCallId);
-      const output = parseObject(resultText);
-      facts.set(message.toolCallId, {
-        name: bareName(message.toolName),
-        arguments: parseObject(message.toolArguments) ?? {},
-        output,
-        outcome: resultText === undefined || resultText === null ? "running" : outcomeOf(bareName(message.toolName), resultText, output !== undefined),
-      });
+  const add = (id: string, name: string, askedAt: string) => {
+    const resultText = results.get(id);
+    const record = active.get(id);
+    let outcome: Outcome;
+    let output: Record<string, unknown> | undefined;
+    if (record !== undefined) {
+      output = record.status === "succeeded" ? parseObject(record.output) : undefined;
+      outcome =
+        record.status === "succeeded"
+          ? "succeeded"
+          : record.status === "failed" || record.status === "rejected"
+            ? outcomeOf(record.error ?? record.rejectionMessage ?? "", false)
+            : record.status === "outcome_unknown"
+              ? "unknown"
+              : "running";
+    } else if (resultText !== undefined) {
+      output = parseObject(resultText);
+      outcome = outcomeOf(resultText, output !== undefined);
+    } else {
+      outcome = "unknown";
+    }
+    facts.set(id, { id, name, outcome, output, resultText: resultText ?? record?.output ?? record?.error ?? undefined, askedAt });
+  };
+  for (const message of messages.filter((candidate) => candidate.role === "assistant")) {
+    for (const call of callsIn(message)) {
+      add(call.id, call.name, message.createdAt);
     }
   }
-  for (const record of snapshot.toolCalls) {
-    const name = bareName(record.toolName);
-    const output = record.status === "succeeded" ? parseObject(record.output) : undefined;
-    const outcome: Outcome =
-      record.status === "succeeded"
-        ? "succeeded"
-        : record.status === "failed" || record.status === "rejected"
-          ? outcomeOf(name, record.error ?? record.rejectionMessage ?? "", false)
-          : record.status === "outcome_unknown"
-            ? "unknown"
-            : "running";
-    facts.set(record.toolCallId, { name, arguments: parseObject(record.arguments) ?? {}, output, outcome });
+  for (const record of snapshot.toolCalls.filter((candidate) => !facts.has(candidate.toolCallId))) {
+    add(record.toolCallId, record.toolName.split("__").at(-1) ?? record.toolName, new Date().toISOString());
   }
   return [...facts.values()];
 }
 
-const replyPattern = /^\[slack (\d+\.\d+)\] <@([A-Z0-9]+)>: ([\s\S]*)$/;
-
-/** Reads review sessions and sends them messages. Connect it once the Client and the session Flow exist. */
+/** Reads reviews and sends their sessions messages. Connect it once the Client and the session Flow exist. */
 export class ReviewSessions {
   private client: Client | undefined;
   private flow: ReviewSessionFlow | undefined;
@@ -165,50 +197,57 @@ export class ReviewSessions {
     }
   }
 
+  /** The reviewer replies the review's thread-watch Flow recorded; none before it exists. */
+  public async replies(accountId: string): Promise<ReviewerReply[]> {
+    try {
+      const [recorded] = await this.dex.client.getAttributes(threadWatchFlowId(accountId), relayedReplies);
+      return recorded ?? [];
+    } catch (error: unknown) {
+      if (error instanceof FlowNotActiveOrNotFoundError) {
+        return [];
+      }
+      throw error;
+    }
+  }
+
   public async read(sessionId: string): Promise<ReviewState> {
     const snapshot = await readAgentSnapshot(this.dex.client, this.dex.flow, sessionId);
     const messages = await this.allMessages(sessionId, snapshot);
     const calls = toolCallsOf(messages, snapshot);
     const succeeded = (name: string) => calls.filter((call) => call.name === name && call.outcome === "succeeded");
 
-    const review = succeeded("post_review")[0];
-    const reviewMessage = review?.output?.message as { channelId?: string; timestamp?: string; userId?: string } | undefined;
+    const reviewPost = succeeded("post_review")[0];
+    const reviewMessage = reviewPost?.output?.message as { channelId?: string; timestamp?: string; userId?: string } | undefined;
     let latestDraft: Draft | undefined;
-    let draftAttempts = review === undefined ? 0 : 1;
+    let draftAttempts = 0;
     let hasUnconfirmedNewerDraft = false;
-    if (review !== undefined && reviewMessage?.timestamp) {
-      latestDraft = { subject: String(review.arguments.emailSubject), body: String(review.arguments.emailBody), ts: reviewMessage.timestamp };
-    }
-    for (const call of calls.filter((candidate) => candidate.name === "post_draft")) {
+    for (const call of calls.filter((candidate) => candidate.name === "post_review" || candidate.name === "post_draft")) {
       if (call.outcome === "succeeded") {
+        const draft = call.output?.draft as Omit<Draft, "ts"> | null | undefined;
         const ts = String((call.output?.message as { timestamp?: string } | undefined)?.timestamp ?? "");
-        latestDraft = { subject: String(call.arguments.subject), body: String(call.arguments.body), ts };
+        // An adopted review post whose draft is not known shows no usable draft.
+        latestDraft = draft ? { ...draft, ts } : call.name === "post_review" ? undefined : latestDraft;
         hasUnconfirmedNewerDraft = false;
-      } else if (call.outcome === "unknown") {
+      } else if (call.outcome === "unknown" && call.name === "post_draft") {
         hasUnconfirmedNewerDraft = true;
       }
-      draftAttempts += call.outcome === "succeeded" || call.outcome === "unknown" ? 1 : 0;
+      draftAttempts += call.outcome === "succeeded" || (call.outcome === "unknown" && call.name === "post_draft") ? 1 : 0;
     }
 
-    const replies: ReviewerReply[] = [];
-    for (const message of messages) {
-      const match = message.role === "user" && message.origin === undefined ? replyPattern.exec(message.text ?? "") : null;
-      if (match !== null && this.reviewerIds.has(match[2]!) && match[2] !== reviewMessage?.userId) {
-        replies.push({ ts: match[1]!, userId: match[2]!, text: match[3]!.trim() });
-      }
-    }
+    const replies = (await this.replies(accountIdOf(sessionId))).filter((reply) => this.reviewerIds.has(reply.userId) && reply.userId !== reviewMessage?.userId);
     let decision: "approve" | "reject" | undefined;
     for (const reply of replies) {
-      decision = /^approve$/i.test(reply.text) ? "approve" : /^reject\s+\S/i.test(reply.text) ? "reject" : decision;
+      decision = /^approve$/i.test(reply.text) ? "approve" : /^reject\s+\S/i.test(reply.text) ? "reject" : /^hold$/i.test(reply.text) ? undefined : decision;
     }
+    const unconfirmedReviewPost = reviewPost === undefined ? calls.find((call) => call.name === "post_review" && call.outcome === "unknown") : undefined;
     return {
       snapshot,
-      startedAt: messages[0]?.createdAt ?? new Date().toISOString(),
-      hasUnconfirmedReviewPost: review === undefined && calls.some((call) => call.name === "post_review" && call.outcome === "unknown"),
+      calls,
       ...(reviewMessage?.timestamp ? { thread: { channel: String(reviewMessage.channelId), ts: reviewMessage.timestamp, botUserId: reviewMessage.userId } } : {}),
       ...(latestDraft === undefined ? {} : { latestDraft }),
       draftAttempts,
       hasUnconfirmedNewerDraft,
+      ...(unconfirmedReviewPost === undefined ? {} : { unconfirmedReviewPostAt: unconfirmedReviewPost.askedAt }),
       replies,
       ...(decision === undefined ? {} : { decision }),
       isApprovedHere: succeeded("approve_account").some((call) => call.output?.status === "approved"),
