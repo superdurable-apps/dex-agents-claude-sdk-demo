@@ -394,6 +394,33 @@ export function registerSignupReviewScenarios(setup: SignupReviewScenarioSetup):
     await waitForStop(accountId);
   });
 
+  test(`${setup.harnessName}: a send Gmail rejects is a definite failure: nothing was sent`, async () => {
+    const { accountId, sessionId, thread } = await startReview("gmailoff", 1710000520);
+    await replyAndWait(sessionId, thread, "approve");
+    gmail
+      .sendMessage()
+      .forFlow(sessionId)
+      .respond(sendMessageBranch("providerRejected", { sender: "", recipients: [], messageId: "", threadId: "" }, { kind: "AUTHORIZATION", provider: "google", operation: "sendMessage", message: "Gmail rejected the message" }));
+    await replyAndWait(sessionId, thread, "send");
+    assert.equal(sendsOf(sessionId).length, 1);
+    assert.ok(threadReplies(sessionId).includes("Sending the welcome email failed: Gmail rejected the message (AUTHORIZATION). Nothing was sent."));
+    assert.ok(!threadReplies(sessionId).some((text) => /Check Sent Mail/.test(text)));
+    // Recorded as failed with the reason, not as an unknown outcome.
+    assert.match((await resultsOf(sessionId, "send_welcome_email")).at(-1) ?? "", /send_welcome_email failed and nothing was sent: Gmail rejected the message \(AUTHORIZATION\)/);
+    await waitForStop(accountId);
+  });
+
+  test(`${setup.harnessName}: a draft the same as the latest one is refused`, async () => {
+    const { sessionId, thread } = await startReview("samedraft", 1710000540);
+    const drafts = () => threadReplies(sessionId).filter((text) => text.startsWith("*[draft ")).length;
+    await replyAndWait(sessionId, thread, "Shorter");
+    assert.equal(drafts(), 1);
+    // The same feedback again makes the scripted model write the same draft.
+    await replyAndWait(sessionId, thread, "Shorter");
+    assert.equal(drafts(), 1);
+    assert.match((await resultsOf(sessionId, "post_draft")).at(-1) ?? "", /refused: this draft is the same as draft 2/);
+  });
+
   test(`${setup.harnessName}: a send before the approval is refused and sends nothing`, async () => {
     const { sessionId, thread } = await startReview("early", 1710000550);
     await replyAndWait(sessionId, thread, "send");
