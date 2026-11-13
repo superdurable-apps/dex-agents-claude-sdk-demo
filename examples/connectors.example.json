@@ -1,7 +1,0 @@
-{
-  "slack": {"bot_token": "xoxb-...", "user_token": "xoxp-..."},
-  "gmail": {"access_token": "ya29....", "primary_email": "you@example.com"},
-  "youtube": {"access_token": "ya29....", "auth_method": "google-oauth-readonly"},
-  "reddit": {"access_token": "...", "client_id": "...", "username": "your_reddit_name"},
-  "spotify": {"access_token": "BQ..."}
-}
