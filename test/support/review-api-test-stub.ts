@@ -36,6 +36,8 @@ export class ReviewApiTestStub {
   public refusesSuppressedMail = false;
   /** Gets answered with a 503 before the next one succeeds. */
   public failingGets = 0;
+  /** Milliseconds every get waits before it answers. */
+  public getDelayMs = 0;
 
   private constructor(private readonly server: Server) {}
 
@@ -103,6 +105,9 @@ export class ReviewApiTestStub {
       return;
     }
     if (operation === "get") {
+      if (this.getDelayMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, this.getDelayMs));
+      }
       if (this.failingGets > 0) {
         this.failingGets -= 1;
         send(response, 503, { error: { code: "unavailable", message: "busy" } });

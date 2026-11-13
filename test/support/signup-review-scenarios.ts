@@ -23,10 +23,10 @@ import { readAgentSnapshot, sendAgentUserMessage, startAgentSession, turnFailure
 import { PrivateDexEngine, pollUntil } from "@superdurable/dex-agents/testing";
 
 import { ReviewApiClient } from "../../src/review-api.js";
-import { ReviewSessions, accountIdOf, effects, reviewLedgerId, reviewSessionId, threadCursor, type ReviewSessionFlow } from "../../src/review-state.js";
+import { ReviewSessions, accountIdOf, effects, reviewLedgerId, reviewSessionId, threadCursor, threadPage, type ReviewSessionFlow } from "../../src/review-state.js";
 import { firstReviewMessage, type SignupServices } from "../../src/signup-agent.js";
 import { startPendingReviews } from "../../src/signup-watcher.js";
-import { SignupReviewLedgerFlow } from "../../src/review-ledger-flow.js";
+import { SignupReviewLedgerFlow, reportedStatusForTest } from "../../src/review-ledger-flow.js";
 import { ReviewApiTestStub } from "./review-api-test-stub.js";
 import {
   FixtureProfileSources,
@@ -93,16 +93,25 @@ class ScriptedThread {
       .respond(isUncertain ? postThreadReplyUncertain({ message: { ...message, timestamp: "" } }, failure("postThreadReply", "lost")) : postThreadReplySent({ message }));
   }
 
+  /** Publishes the thread as Slack pages it: 15 messages a page, the root first; page n > 1 has cursor `page-<n>`. */
   private publish(): void {
     this.version += 1;
     const version = this.version;
-    const snapshot: SlackMessage[] = [{ channelId, timestamp: this.rootTs, userId: botUserId, text: "review" }, ...this.messages];
-    this.slack
-      .listThreadMessages()
-      .forFlow(this.watchId)
-      .when(() => this.version === version, listThreadMessagesRead({ messages: snapshot }));
+    const all: SlackMessage[] = [{ channelId, timestamp: this.rootTs, userId: botUserId, text: "review" }, ...this.messages];
+    for (let page = 1; (page - 1) * 15 < all.length; page++) {
+      const cursor = page === 1 ? "" : `page-${page}`;
+      const hasNext = page * 15 < all.length;
+      this.slack
+        .listThreadMessages()
+        .forFlow(this.watchId)
+        .when(
+          (input) => this.version === version && (input.cursor ?? "") === cursor,
+          listThreadMessagesRead({ messages: all.slice((page - 1) * 15, page * 15), ...(hasNext ? { nextCursor: `page-${page + 1}` } : {}) }),
+        );
+    }
   }
 }
+
 
 /** Registers the scenarios every harness passes. */
 export function registerSignupReviewScenarios(setup: SignupReviewScenarioSetup): void {
@@ -130,7 +139,7 @@ export function registerSignupReviewScenarios(setup: SignupReviewScenarioSetup):
     slack = new GeneratedMock("review-slack");
     gmail = new GmailMock("welcome-gmail");
     services = {
-      sessions: new ReviewSessions(new Set([reviewerId, botUserId])),
+      sessions: new ReviewSessions(new Set([reviewerId])),
       reviewApi: new ReviewApiClient({ baseUrl: reviewApi.baseUrl, apiKey: reviewApi.apiKey }),
       profiles: (profiles = new FixtureProfileSources()),
       slack: slack.connection(),
@@ -139,8 +148,15 @@ export function registerSignupReviewScenarios(setup: SignupReviewScenarioSetup):
       harnessLabel: setup.harnessName,
     };
     sessionFlow = await setup.createFlow(services);
-    // The bot is listed as a reviewer on purpose: its own posts must still never count.
-    ledgerFlow = new SignupReviewLedgerFlow({ ...services, reviewerSlackIds: new Set([reviewerId, botUserId]), client: () => client, pollIntervalMs: 200, accountCheckEveryRounds: 3 });
+    // The ledger lists the bot as a reviewer on purpose: its own posts must still never be relayed.
+    ledgerFlow = new SignupReviewLedgerFlow({
+      ...services,
+      reviewerSlackIds: new Set([reviewerId, botUserId]),
+      client: () => client,
+      pollIntervalMs: 200,
+      accountCheckEveryRounds: 3,
+      roundTimeoutMs: 1_500,
+    });
     registry = new Registry([sessionFlow, ledgerFlow]);
     cacheDirectory = mkdtempSync(join(tmpdir(), "signup-agent-test-"));
     blobCache = openBlobCache({ directory: cacheDirectory, maxBytes: 64 * 1024 * 1024 });
@@ -150,7 +166,8 @@ export function registerSignupReviewScenarios(setup: SignupReviewScenarioSetup):
   });
 
   async function startWorker(): Promise<Worker> {
-    const started = new Worker(registry, blobCache, { serverAddress: engine.serverAddress, pull: { stopDrainTimeoutMs: 1_000 } });
+    // Each open review's ledger holds a slot while it polls, and most tests leave their review open.
+    const started = new Worker(registry, blobCache, { serverAddress: engine.serverAddress, pull: { stopDrainTimeoutMs: 1_000, maxConcurrentTasks: 64 } });
     await started.start();
     await started.waitPullRegistered({ timeoutMs: 30_000 });
     return started;
@@ -362,7 +379,7 @@ export function registerSignupReviewScenarios(setup: SignupReviewScenarioSetup):
     assert.match((await resultsOf(sessionId, "send_welcome_email")).at(-1) ?? "", /refused: send_welcome_email already ran/);
   });
 
-  test(`${setup.harnessName}: a send in a turn that then failed blocks any later send`, async () => {
+  test(`${setup.harnessName}: a send in a turn whose next model call failed blocks any later send`, async () => {
     const { accountId, sessionId, thread } = await startReview(crashingApplicantWord, 1710000390);
     thread.scriptBotReply();
     await replyAndWait(sessionId, thread, "approve");
@@ -436,7 +453,7 @@ export function registerSignupReviewScenarios(setup: SignupReviewScenarioSetup):
     const { sessionId } = await startReview("reconcile", 1710001000, "ada-builds", (id) => {
       const footer = `_Reviewed by ${setup.harnessName} · Dex session \`${id}\`_`;
       slack.postChannelMessage().forFlow(id).respond(postChannelMessageUncertain({ message: { channelId, timestamp: "", text: "" } }, failure("postChannelMessage", "lost")));
-      slack.getWorkspaceIdentity().forFlow(id).respond(
+      slack.getWorkspaceIdentity().forFlow(id).default(
         getWorkspaceIdentityRead({ teamId: "T1", teamName: "Super Durable", workspaceUrl: "https://example.slack.com/", botUserId, botUserName: "dex", botId }),
       );
       // Newest first: a person quoting the footer does not count; the app's own post does, with an older draft.
@@ -513,7 +530,7 @@ export function registerSignupReviewScenarios(setup: SignupReviewScenarioSetup):
     assert.equal(reviewApi.accountOf(accountId)?.status, "active");
   });
 
-  test(`${setup.harnessName}: an attempted send without an outcome, as a crash, steer or cancel leaves it, blocks any later send`, async () => {
+  test(`${setup.harnessName}: an attempted send record injected through record_effect blocks any later send`, async () => {
     const { accountId, sessionId, thread } = await startReview("steered", 1710001100);
     thread.scriptBotReply();
     await replyAndWait(sessionId, thread, "approve");
@@ -565,7 +582,76 @@ export function registerSignupReviewScenarios(setup: SignupReviewScenarioSetup):
     const account = reviewApi.addPendingAccount({ accountId, email: `noledger@example.com`, profileUrl: "https://github.com/ada-builds" });
     await startAgentSession(client, sessionFlow, sessionId, { initialMessage: firstReviewMessage(account) }, { requestId: accountId });
     await waitForIdle(sessionId);
+    await sendAndWait(sessionId, "[test]: approve now");
+    await sendAndWait(sessionId, "[test]: shorter please");
+    await sendAndWait(sessionId, "[test]: send now");
+    for (const name of ["post_review", "post_draft", "reply_in_thread", "send_welcome_email", "approve_account"]) {
+      assert.match((await resultsOf(sessionId, name)).at(-1) ?? "", /refused: the review ledger .* does not exist/, name);
+    }
     assert.equal(slack.postChannelMessage().calls().filter((call) => call.flowId === sessionId).length, 0);
-    assert.match((await resultsOf(sessionId, "post_review")).at(-1) ?? "", /refused: the review ledger .* does not exist/);
+    assert.equal(slack.postThreadReply().calls().filter((call) => call.flowId === sessionId).length, 0);
+    assert.equal(sendsOf(sessionId).length, 0);
   });
+
+  test(`${setup.harnessName}: a send the provider refused after the dispatch stays attempted and blocks any later send`, async () => {
+    const { accountId, sessionId, thread } = await startReview("rejectedsend", 1710001400);
+    thread.scriptBotReply();
+    await replyAndWait(sessionId, thread, "approve");
+    gmail
+      .sendMessage()
+      .forFlow(sessionId)
+      .respond(sendMessageBranch("providerRejected", { sender: "", recipients: [], messageId: "", threadId: "" }, { kind: "PROVIDER_REJECTION", provider: "google", operation: "sendMessage", message: "rejected" }));
+    await replyAndWait(sessionId, thread, "send");
+    assert.equal(sendsOf(sessionId).length, 1);
+    assert.deepEqual((await ledgerEffects(accountId)).filter((effect) => effect.tool === "send_welcome_email").map((effect) => effect.status), ["attempted"]);
+    assert.equal((await services.sessions.read(accountId)).hasSendAttempt, true);
+  });
+
+  test(`${setup.harnessName}: record_effect lets a once-only write happen once and not_sent only follow an attempt`, async () => {
+    const { accountId } = await startReview("onceonly", 1710001500);
+    const ledgerId = reviewLedgerId(accountId);
+    await client.invokeRPC(ledgerFlow.recordEffect, ledgerId, { callKey: "first-send", tool: "send_welcome_email", status: "attempted" });
+    await assert.rejects(client.invokeRPC(ledgerFlow.recordEffect, ledgerId, { callKey: "second-send", tool: "send_welcome_email", status: "attempted" }), /at most once/);
+    await assert.rejects(client.invokeRPC(ledgerFlow.recordEffect, ledgerId, { callKey: "never-attempted", tool: "post_draft", status: "not_sent" }), /needs an attempted effect/);
+    // The review post already succeeded, so a second review post is refused as well.
+    await assert.rejects(client.invokeRPC(ledgerFlow.recordEffect, ledgerId, { callKey: "second-review", tool: "post_review", status: "attempted" }), /at most once/);
+    assert.deepEqual((await ledgerEffects(accountId)).filter((effect) => effect.tool === "send_welcome_email").map((effect) => effect.callKey), ["first-send"]);
+  });
+
+  test(`${setup.harnessName}: a round abandoned by its timeout writes nothing`, async () => {
+    const { accountId, sessionId } = await startReview("slowround", 1710001600);
+    reviewApi.decideElsewhere(accountId, "active");
+    // Every account read takes longer than a round may: each such round is abandoned before it reports.
+    reviewApi.getDelayMs = 3_000;
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 5_000));
+      assert.equal((await client.getAttributes(reviewLedgerId(accountId), reportedStatusForTest))[0], undefined);
+      assert.equal((await userTexts(sessionId)).filter((text) => text.startsWith("[dex-cloud")).length, 0);
+    } finally {
+      reviewApi.getDelayMs = 0;
+    }
+    await pollUntil(async () => ((await userTexts(sessionId)).some((text) => text.startsWith("[dex-cloud active]")) ? true : undefined), {
+      description: "the report once rounds are fast again",
+      ...waitOptions,
+    });
+    assert.equal((await userTexts(sessionId)).filter((text) => text.startsWith("[dex-cloud active]")).length, 1);
+  });
+
+  test(`${setup.harnessName}: the ledger reads one thread page a round and moves on when a page is full`, async () => {
+    const { accountId, sessionId, thread } = await startReview(passiveApplicantWord, 1710001700);
+    // 15 bystander messages fill the first page with the root; the reviewer's reply lands on page 2.
+    for (let index = 0; index < 15; index++) {
+      thread.reply(bystanderId, `chatter ${index}`);
+    }
+    const replyTs = await replyAndWait(sessionId, thread, "a note on page two");
+    assert.equal((await client.getAttributes(reviewLedgerId(accountId), threadPage))[0], "page-2");
+    const reads = slack.listThreadMessages().calls().filter((call) => call.flowId === reviewLedgerId(accountId));
+    const firstOnPageTwo = reads.findIndex((call) => call.input.cursor === "page-2");
+    assert.ok(firstOnPageTwo > 0);
+    // Once on page 2, no round reads the thread from its start again.
+    assert.ok(reads.slice(firstOnPageTwo).every((call) => call.input.cursor === "page-2"));
+    assert.ok(reads.every((call) => call.input.pageSize === 15));
+    assert.equal((await services.sessions.read(accountId)).replies.at(-1)?.ts, replyTs);
+  });
+
 }
