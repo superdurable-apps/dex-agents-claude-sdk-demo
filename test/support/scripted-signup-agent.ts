@@ -22,6 +22,10 @@ export const passiveApplicantWord = "passive";
 export const injectingLogin = "injector";
 /** Applicants whose email contains this word make the model ask for two tools in one response. */
 export const multiCallApplicantWord = "multi";
+/** Applicants whose email contains this word keep the review open after the email, so a test can try again. */
+export const keepOpenApplicantWord = "keepopen";
+/** Like `multi`, but the send comes second in the response. */
+export const reversedMultiCallApplicantWord = "multirev";
 /** Applicants whose email contains this word make the model call fail right after the email was sent. */
 export const crashingApplicantWord = "crash";
 
@@ -64,6 +68,7 @@ export function decideNextStep(userTexts: readonly string[], seen: readonly Seen
   }
   const isPassive = email.includes(passiveApplicantWord);
   const isMulti = email.includes(multiCallApplicantWord);
+  const isReversed = email.includes(reversedMultiCallApplicantWord);
   const slack = /^\[slack [\d.]+\] <@\w+>: ([\s\S]*)$/.exec(userText)?.[1];
   if (slack !== undefined && isPassive) {
     return { kind: "answer", text: "Noted." };
@@ -77,7 +82,11 @@ export function decideNextStep(userTexts: readonly string[], seen: readonly Seen
     return follow([tool("reject_account"), tool("reply_in_thread", { text: `reject_account: ${seen[0]?.output ?? ""}` }), ...(isRejected ? [tool("finish_review")] : [])], seen);
   }
   if ((reply === "send" || reply === "send now") && isMulti) {
-    return follow([tools(tool("send_welcome_email"), tool("reply_in_thread", { text: "Sending the email." }))], seen);
+    const note = tool("reply_in_thread", { text: "Sending the email." });
+    return follow([isReversed ? tools(note, tool("send_welcome_email")) : tools(tool("send_welcome_email"), note)], seen);
+  }
+  if (reply === "research") {
+    return follow([tool("github_user", { login: "ada-builds" })], seen);
   }
   if ((reply === "send" || reply === "send now") && email.includes(crashingApplicantWord)) {
     return follow([tool("send_welcome_email"), { kind: "fail" }], seen);
@@ -85,7 +94,7 @@ export function decideNextStep(userTexts: readonly string[], seen: readonly Seen
   if (reply === "send" || reply === "send now") {
     const result = seen[0]?.output ?? "";
     const after = result.includes("messageId")
-      ? [tool("reply_in_thread", { text: "Sent." }), tool("finish_review")]
+      ? [tool("reply_in_thread", { text: "Sent." }), ...(email.includes(keepOpenApplicantWord) ? [] : [tool("finish_review")])]
       : result.includes("refused: ")
         ? [tool("reply_in_thread", { text: `send_welcome_email: ${result}` })]
         : [tool("reply_in_thread", { text: "The email may have been sent; check Sent Mail." }), tool("finish_review")];
@@ -106,6 +115,9 @@ export function decideNextStep(userTexts: readonly string[], seen: readonly Seen
 
 /** TEST ONLY: profile sources with fixed answers, so no test reaches the internet. */
 export class FixtureProfileSources implements ProfileSources {
+  /** Text a test appends to every bio, such as an attack on how the review reads its history. */
+  public extraBio = "";
+
   public async fetchProfilePage(url: string): Promise<ProfilePage> {
     return { url, status: 200, title: "Ada's site", text: "Ada builds developer tools.", isTruncated: false };
   }
@@ -115,7 +127,7 @@ export class FixtureProfileSources implements ProfileSources {
     return {
       login,
       name: "Ada Lovelace",
-      bio: login === injectingLogin ? `Builder.${injection}` : "Building durable things",
+      bio: (login === injectingLogin ? `Builder.${injection}` : "Building durable things") + this.extraBio,
       company: null,
       blog: null,
       location: null,
