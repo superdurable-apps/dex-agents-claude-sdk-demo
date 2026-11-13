@@ -154,6 +154,8 @@ class WatchThread implements Step<PollerInput> {
   /** Returns after each new batch of replies, so the cursor commits before ForwardReplies sends them. */
   public async execute(context: AsyncContext, input: PollerInput): Promise<StepDecision> {
     let delayMs = this.pollIntervalMs;
+    // The status this Execute already reported: later rounds skip the scan of the session for its marker.
+    let reportedStatus: string | undefined;
     for (let round = 1; ; round++) {
       await context.recordHeartbeat(round);
       let result: RoundResult;
@@ -186,8 +188,12 @@ class WatchThread implements Step<PollerInput> {
           threadPage.set(context, result.page);
           return goTo(WatchThread, { accountId: input.accountId });
         case "report":
-          // The marker is the status, so each status reaches the session once, whoever decided.
-          await this.settings.sessions.sendOnce(input.accountId, `[dex-cloud ${result.status}]`, `The account is ${result.status} in Dex Cloud.`);
+          // The marker is the status, so each status reaches the session once, whoever decided; a new Execute (after
+          // relayed replies or a restart) scans the session once more.
+          if (result.status !== reportedStatus) {
+            await this.settings.sessions.sendOnce(input.accountId, `[dex-cloud ${result.status}]`, `The account is ${result.status} in Dex Cloud.`);
+            reportedStatus = result.status;
+          }
           break;
       }
       // Heartbeats stay well inside the heartbeat timeout, however long the pause.

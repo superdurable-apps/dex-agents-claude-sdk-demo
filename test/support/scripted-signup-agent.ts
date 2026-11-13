@@ -53,6 +53,11 @@ export function decideNextStep(userTexts: readonly string[], seen: readonly Seen
     });
     return follow([tool("github_user", { login }), review], seen);
   }
+  const slackTs = /^\[slack ([\d.]+)\]/.exec(userText)?.[1];
+  if (slackTs !== undefined && userTexts.slice(0, -1).some((text) => text.startsWith(`[slack ${slackTs}]`))) {
+    // As the prompt says: a repeated ts is ignored.
+    return { kind: "answer", text: "Already handled." };
+  }
   const slack = /^\[slack [\d.]+\] <@\w+>: ([\s\S]*)$/.exec(userText)?.[1];
   if (slack !== undefined && email.includes(passiveApplicantWord)) {
     return { kind: "answer", text: "Noted." };

@@ -10,7 +10,7 @@ import { GmailMock, sendMessageBranch } from "@superdurable/connector-google-gma
 import type { Message as SlackMessage } from "@superdurable/connector-slack";
 import { GeneratedMock, listThreadMessagesRead, postThreadReplySent, postThreadReplyUncertain, postChannelMessageSent } from "@superdurable/connector-slack/mock";
 import { Client, Registry, Worker, openBlobCache, type BlobCache } from "@superdurable/dex";
-import { readAgentSnapshot } from "@superdurable/dex-agents";
+import { readAgentSnapshot, sendAgentUserMessage } from "@superdurable/dex-agents";
 import { PrivateDexEngine, pollUntil } from "@superdurable/dex-agents/testing";
 
 import { ReviewApiClient } from "../../src/review-api.js";
@@ -208,6 +208,13 @@ export function registerSignupReviewScenarios(setup: SignupReviewScenarioSetup):
     return ts;
   }
 
+  /** Sends a message to the session directly, as a test operator would, and waits for the turn it starts. */
+  async function sendAndWait(sessionId: string, text: string): Promise<void> {
+    const turns = await turnsOf(sessionId);
+    await sendAgentUserMessage(client, sessionFlow, sessionId, { text });
+    await waitForIdle(sessionId, turns);
+  }
+
   /** Waits until the poller stopped the session and completed. */
   async function waitForStop(accountId: string): Promise<void> {
     for (const flowId of [reviewSessionId(accountId), reviewPollerId(accountId)]) {
@@ -296,6 +303,34 @@ export function registerSignupReviewScenarios(setup: SignupReviewScenarioSetup):
     assert.equal(reviewApi.accountOf(accountId)?.status, "active");
     assert.deepEqual(decisionsOf(accountId).map((decision) => decision.requestId), [`${sessionId}-approve`]);
     assert.match(threadReplies(sessionId).at(-1)!, /^Approved /);
+  });
+
+  test(`${setup.harnessName}: an applied approval whose answer was lost, with the ReviewAPI busy since, is an unknown outcome`, async () => {
+    const { accountId, sessionId, thread } = await startReview("busyafter", 1710000210);
+    // The approval is applied, its answer lost, and every account read after it is busy, so each retry fails.
+    reviewApi.failNextResponse("approve", 1_000);
+    try {
+      await replyAndWait(sessionId, thread, "approve");
+    } finally {
+      reviewApi.failingGets = 0;
+    }
+    assert.equal(reviewApi.accountOf(accountId)?.status, "active");
+    assert.equal(decisionsOf(accountId).length, 1);
+    assert.equal(threadReplies(sessionId).at(-1), "Approval outcome unknown: ReviewAPI get: busy. Check the account in Dex Cloud admin; the review continues.");
+    assert.ok(!threadReplies(sessionId).some((text) => text.startsWith("Approval failed")));
+    // The model is told the outcome is unknown, not that the approval failed.
+    assert.match((await resultsOf(sessionId, "approve_account")).at(-1) ?? "", /outcome (is )?unknown/);
+    assert.equal((await client.describeFlow(sessionId)).status, "running");
+  });
+
+  test(`${setup.harnessName}: a [slack <ts>] message that arrives twice is handled once`, async () => {
+    const { sessionId, thread } = await startReview("twice", 1710000230);
+    const drafts = () => threadReplies(sessionId).filter((text) => text.startsWith("*[draft ")).length;
+    const ts = await replyAndWait(sessionId, thread, "Shorter");
+    assert.equal(drafts(), 1);
+    // The same relay again, as an overlap of two ForwardReplies attempts could deliver it.
+    await sendAndWait(sessionId, `[slack ${ts}] <@${reviewerId}>: Shorter`);
+    assert.equal(drafts(), 1);
   });
 
   test(`${setup.harnessName}: the agent's own approval reported as [dex-cloud active], once, does no harm, even after a hold`, async () => {

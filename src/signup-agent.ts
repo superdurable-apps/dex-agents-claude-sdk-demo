@@ -7,7 +7,7 @@ import gmailManifest from "@superdurable/connector-google-gmail/dex-connector.js
 import type { GmailConnection } from "@superdurable/connector-google-gmail";
 import slackManifest from "@superdurable/connector-slack/dex-connector.json" with { type: "json" };
 import type { Connection as SlackConnection } from "@superdurable/connector-slack";
-import { ToolExecutionError, type ToolEffect, type ToolSource } from "@superdurable/dex-agents";
+import { ToolExecutionError, ToolOutcomeUnknownError, type ToolEffect, type ToolSource } from "@superdurable/dex-agents";
 import { ConnectorToolSource, connectorTool, type ConnectorPackageManifest } from "@superdurable/dex-agents/connectors";
 import { z } from "zod";
 
@@ -27,7 +27,8 @@ Procedure:
    - "send", once the account is approved: call send_welcome_email. It sends the latest posted draft. If it fails in any way other than a refusal, never call it again: the email may have been sent.
    - "hold": do nothing until the next reply; it cancels a decision or send you have not made yet.
    - Anything else is feedback on the email: write a new draft and call post_draft.
-   - approve_account, reject_account and send_welcome_email post their own confirmation or failure in the thread: never repeat it.
+   - approve_account, reject_account and send_welcome_email post their own confirmation or failure in the thread: never repeat it. When approve_account or reject_account reports an unknown outcome, do not call it again unless an admin asks again; the tool already asked the admins to check Dex Cloud admin.
+   - Handle each "[slack <ts>]" message at most once: a message whose ts you have already seen is a repeat; ignore it.
    - When you mention a draft, mean the latest one, and never number drafts in your own text: the tools number them.
    - Messages "[dex-cloud <status>]" report that the account is no longer pending in Dex Cloud. When the status is the result of your own successful approve_account or reject_account, ignore the message and carry on. Otherwise the account was decided in Dex Cloud admin: say so with reply_in_thread and finish.
    A tool that refuses tells you why; explain it briefly with reply_in_thread when it helps the admins. Be concise.
@@ -158,14 +159,19 @@ async function slackIdentity(services: SignupServices, call: Call) {
   return identity.value;
 }
 
+/** A busy or unreachable ReviewAPI: the request may or may not have been applied. */
+const isTransientReviewApiError = (error: unknown): boolean =>
+  error instanceof ReviewApiError
+    ? error.httpStatus === 429 || error.httpStatus >= 500
+    : error instanceof TypeError || (error instanceof Error && (error.name === "TimeoutError" || error.name === "AbortError"));
+
 /** Runs `work` again after a busy or unreachable ReviewAPI, up to 3 times: decisions carry stable request IDs. */
 async function withRetries<T>(signal: AbortSignal, work: () => Promise<T>): Promise<T> {
   for (let attempt = 1; ; attempt++) {
     try {
       return await work();
     } catch (error: unknown) {
-      const isTransient = error instanceof ReviewApiError ? error.httpStatus === 429 || error.httpStatus >= 500 : error instanceof TypeError || (error instanceof Error && error.name === "TimeoutError");
-      if (!isTransient || attempt >= 3 || signal.aborted) {
+      if (!isTransientReviewApiError(error) || attempt >= 3 || signal.aborted) {
         throw error;
       }
       await new Promise((resolve) => setTimeout(resolve, 500 * attempt));
@@ -173,38 +179,51 @@ async function withRetries<T>(signal: AbortSignal, work: () => Promise<T>): Prom
   }
 }
 
+/** A decision whose request was sent, and whose outcome a busy or unreachable ReviewAPI left unknown. */
+class DecisionOutcomeUnknown extends Error {}
+
 /**
  * Approves or rejects the account with the expected revision and a stable request ID, so a retry after an applied
  * call that lost its answer finds the account already decided that way, which is success. An account already active
- * counts as approved; an account decided the other way is a failure.
+ * counts as approved; an account decided the other way is a failure. When the request was sent and the ReviewAPI
+ * stays busy or unreachable, the outcome is unknown: {@link DecisionOutcomeUnknown}.
  */
 async function decide(services: SignupServices, accountId: string, decision: "approve" | "reject", signal: AbortSignal): Promise<Account> {
   const target = decision === "approve" ? "active" : "rejected";
-  return withRetries(signal, async () => {
-    let account = await services.reviewApi.getAccount(accountId, signal);
-    if (account.status === "pending_approval") {
-      const request = { accountId, requestId: `${reviewSessionId(accountId)}-${decision}`, expectedRevision: account.revision };
-      try {
-        account =
-          decision === "approve"
-            ? // The platform's own approval mail is left out once the ReviewAPI supports it; until then it refuses this.
-              await services.reviewApi.approveAccount({ ...request, suppressApprovedMail: true }, signal)
-            : await services.reviewApi.rejectAccount(request, signal);
-      } catch (error: unknown) {
-        if (!(error instanceof ReviewApiError) || (error.code !== "revision_conflict" && error.code !== "failed_precondition")) {
-          throw error;
-        }
-        account = error.currentAccount ?? (await services.reviewApi.getAccount(accountId, signal));
-        if (error.code === "failed_precondition" && account.status !== target) {
-          throw new Error(`the review API refused the decision: ${error.message}`);
-        }
+  let isSent = false;
+  try {
+    return await withRetries(signal, () => decideOnce(services, accountId, decision, target, signal, () => (isSent = true)));
+  } catch (error: unknown) {
+    throw isSent && isTransientReviewApiError(error) ? new DecisionOutcomeUnknown(messageOf(error)) : error;
+  }
+}
+
+/** One try of {@link decide}; `markSent` runs before the decision request goes out. */
+async function decideOnce(services: SignupServices, accountId: string, decision: "approve" | "reject", target: string, signal: AbortSignal, markSent: () => void): Promise<Account> {
+  let account = await services.reviewApi.getAccount(accountId, signal);
+  if (account.status === "pending_approval") {
+    const request = { accountId, requestId: `${reviewSessionId(accountId)}-${decision}`, expectedRevision: account.revision };
+    markSent();
+    try {
+      account =
+        decision === "approve"
+          ? // The platform's own approval mail is left out once the ReviewAPI supports it; until then it refuses this.
+            await services.reviewApi.approveAccount({ ...request, suppressApprovedMail: true }, signal)
+          : await services.reviewApi.rejectAccount(request, signal);
+    } catch (error: unknown) {
+      if (!(error instanceof ReviewApiError) || (error.code !== "revision_conflict" && error.code !== "failed_precondition")) {
+        throw error;
+      }
+      account = error.currentAccount ?? (await services.reviewApi.getAccount(accountId, signal));
+      if (error.code === "failed_precondition" && account.status !== target) {
+        throw new Error(`the review API refused the decision: ${error.message}`);
       }
     }
-    if (account.status !== target) {
-      throw new Error(`the account is ${account.status}`);
-    }
-    return account;
-  });
+  }
+  if (account.status !== target) {
+    throw new Error(`the account is ${account.status}`);
+  }
+  return account;
 }
 
 /** The package manifest entry of `operationId`, offered under the tool's own arguments and description. */
@@ -308,7 +327,14 @@ export function createSignupConnectorTools(services: SignupServices): ToolSource
       try {
         account = await decide(services, accountId, decision, call.context.cancellationSignal);
       } catch (error: unknown) {
-        await confirm(thread, `${decision === "approve" ? "Approval" : "Rejection"} failed: ${oneLine(messageOf(error), "unknown error")}.`, post);
+        const noun = decision === "approve" ? "Approval" : "Rejection";
+        if (error instanceof DecisionOutcomeUnknown) {
+          // The request went out and the ReviewAPI stayed busy: the account may be decided. Dex records outcome_unknown
+          // and never retries the call, and the model is told its outcome is unknown.
+          await confirm(thread, `${noun} outcome unknown: ${oneLine(error.message, "unknown error")}. Check the account in Dex Cloud admin; the review continues.`, post);
+          throw new ToolOutcomeUnknownError(`${decision}_account outcome unknown: ${error.message}`);
+        }
+        await confirm(thread, `${noun} failed: ${oneLine(messageOf(error), "unknown error")}.`, post);
         throw new ToolExecutionError(`${decision}_account failed: ${messageOf(error)}`);
       }
       const applicant = `${oneLine(account.displayName, "(no name)")} (${oneLine(account.email, "")})`;

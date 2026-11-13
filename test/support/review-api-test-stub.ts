@@ -77,9 +77,13 @@ export class ReviewApiTestStub {
   }
 
   /** Applies the next `operation` call, then answers 503 instead of the result. */
-  public failNextResponse(operation: "approve" | "reject"): void {
+  public failNextResponse(operation: "approve" | "reject", thenFailingGets = 0): void {
     this.failAfterApplying.add(operation);
+    this.getsFailingAfterLostAnswer = thenFailingGets;
   }
+
+  /** Gets answered with a 503 once a lost answer was sent, as a ReviewAPI that stays busy. */
+  private getsFailingAfterLostAnswer = 0;
 
   /** Refuses the next `operation` call with `failed_precondition`, applying nothing. */
   public refuseNext(operation: "approve" | "reject"): void {
@@ -159,6 +163,7 @@ export class ReviewApiTestStub {
     stored.account = { ...stored.account, status: operation === "approve" ? "active" : "rejected", revision: Number(stored.account.revision) + 1 };
     stored.lastDecision = { fingerprint, account: stored.account };
     if (this.failAfterApplying.delete(operation)) {
+      this.failingGets = this.getsFailingAfterLostAnswer;
       send(response, 503, { error: { code: "unavailable", message: "lost answer" } });
       return;
     }
