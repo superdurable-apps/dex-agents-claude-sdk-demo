@@ -302,7 +302,12 @@ export function createSignupConnectorTools(services: SignupServices): ToolSource
     write(threadReply, async (call, args) => {
       const accountId = accountOf(call);
       const reason = decision === "reject" ? rejectSchema.parse(args).reason : "";
-      const thread = await beforeDispatch(() => requireThread(accountId));
+      const thread = await beforeDispatch(async () => {
+        const thread = await requireThread(accountId);
+        // Recorded before the decision, so the poller never takes it for one made in Dex Cloud admin.
+        await sessions.recordDecision(accountId, decision);
+        return thread;
+      });
       const post = async (input: ThreadReplyInput) => threadReply.invoke(call, input);
       let account: Account;
       try {

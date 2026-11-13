@@ -138,9 +138,10 @@ before switching, or switch back to let them finish.
   with Request ID `<accountId>-poller`, so a repeated start joins the same run.
   - Attributes: `Thread` (the review post's channel, timestamp and the Slack app's user, set at the
     start) and `LatestDraft` (draft 1 at the start, then each post_draft through the `record_draft` RPC),
-    which the tools read with `getAttributes`; `FinishedAt`, set by finish_review through the `finish`
-    RPC; and its own reading state: `Cursor` (the last relayed reply), `ThreadPage` (the thread page being
-    read), `ReviewerDecision` and `ReportedStatus`. The RPCs and the polling Step write different
+    which the tools read with `getAttributes`; `AgentDecision`, which approve_account and reject_account
+    set through the `record_decision` RPC before they decide; `FinishedAt`, set by finish_review through
+    the `finish` RPC; and its own reading state: `Cursor` (the last relayed reply), `ThreadPage` (the
+    thread page being read) and `ReportedStatus`. The RPCs and the polling Step write different
     Attributes, so neither needs a lock.
   - Its polling Step reads one page (15 messages) of the review thread every 60 seconds with the Slack
     connector's `listThreadMessages`, in one long-running Execute (the Dex polling pattern); after a full
@@ -151,8 +152,8 @@ before switching, or switch back to let them finish.
     seconds is abandoned without a trace. A Slack 429 or 5xx, a busy ReviewAPI, a passing Dex error or
     such a timeout skips a round with a back-off; a crash retries the Step up to 4 times.
   - It reads the account too, and tells the session `[dex-cloud <status>]`, once, when the account was
-    decided in Dex Cloud admin: a status that the last relayed `approve` or `reject <reason>` explains is
-    the agent's own decision and is not reported.
+    decided in Dex Cloud admin: a status that `AgentDecision` explains is the agent's own decision and
+    is not reported, whatever the reviewers wrote since.
   - It stops the session once the review is finished and the session is idle; after 7 days from the
     session's start, when the session failed, or after a lasting failure it stops the session and posts a
     note in the thread.
@@ -214,7 +215,8 @@ the account's status, the tools confirm the approval and the send in the thread,
 app's own messages are never relayed, each reviewer reply reaches the session once, the agent's own
 approval is not reported as a Dex Cloud admin decision, and the review ends with the session and the
 poller stopped; an approval the server refuses and a rejection it refuses, each posting its failure; an
-approval whose answer was lost, tried again and counted as approved; a confirmation post that fails
+approval whose answer was lost, tried again and counted as approved; an approval followed by `hold`,
+still not reported as a Dex Cloud admin decision; a confirmation post that fails
 without changing the approval; a rejection with its reason in the thread; a send that fails, with the
 Sent Mail note; a send before the approval, refused; two tool calls in one model response; an account
 decided in Dex Cloud admin while the ReviewAPI is busy; a sign-up from before `SIGNUP_REVIEW_SINCE`; the
@@ -236,9 +238,12 @@ injected lookup, for redirects to private addresses, and for linear-time parsing
 - The check that `SIGNUP_REVIEWER_SLACK_IDS` does not list the app's own Slack user runs in
   `post_review`, not at Worker start: the identity read is a connector call, and connector calls run
   inside a Dex Step.
-- If an admin approves the account in Dex Cloud admin while the reviewers' last decision is also
-  `approve`, the poller takes it for the agent's own approval and does not report it; the agent may
-  still send the welcome email, next to the platform's own approval mail.
+- If an admin approves the account in Dex Cloud admin after approve_account was tried (even when it
+  failed), the poller takes it for the agent's own approval and does not report it; the agent may still
+  send the welcome email, next to the platform's own approval mail.
+- The poller starts only when post_review succeeds. A session whose review post never went out (Slack
+  refused it, the app is listed as a reviewer, or the outcome is unknown) has no poller: nothing stops it
+  after 7 days, and it waits until someone cancels it in Dex Web.
 - Forwarding a reply checks the session for its marker and then sends it. If a heartbeat timeout lets
   an old and a new attempt of `ForwardReplies` overlap, one reply can reach the session twice; at worst
   the agent acts on it twice, and each connector call still happens at most once.

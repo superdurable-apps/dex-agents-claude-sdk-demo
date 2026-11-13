@@ -14,7 +14,7 @@ import {
   type DeferredToolOutcome,
 } from "@superdurable/dex-agents";
 
-import { finishedAt, latestDraft, reviewThread, type Draft, type ReviewThread, type SignupReviewThreadPoller } from "./review-thread-poller.js";
+import { agentDecision, finishedAt, latestDraft, reviewThread, type Draft, type ReviewThread, type SignupReviewThreadPoller } from "./review-thread-poller.js";
 
 /** An agent session Flow of either harness. */
 export type ReviewSessionFlow = AgentSessionFlow<AgentFrameworkRunner<DeferredToolOutcome>>;
@@ -37,6 +37,8 @@ export interface ReviewRecord {
   readonly thread: ReviewThread | undefined;
   readonly latestDraft: Draft | undefined;
   readonly isFinished: boolean;
+  /** The decision approve_account or reject_account last made or tried. */
+  readonly decision: string | undefined;
 }
 
 const isMissing = (error: unknown) => error instanceof FlowNotFoundError || error instanceof FlowNotActiveOrNotFoundError;
@@ -61,11 +63,11 @@ export class ReviewSessions {
   /** The review's thread and latest draft from its poller; empty when no review post succeeded yet. */
   public async read(accountId: string): Promise<ReviewRecord> {
     try {
-      const [thread, draft, finished] = await this.dex.client.getAttributes(reviewPollerId(accountId), reviewThread, latestDraft, finishedAt);
-      return { thread, latestDraft: draft, isFinished: finished !== undefined };
+      const [thread, draft, finished, decision] = await this.dex.client.getAttributes(reviewPollerId(accountId), reviewThread, latestDraft, finishedAt, agentDecision);
+      return { thread, latestDraft: draft, isFinished: finished !== undefined, decision };
     } catch (error: unknown) {
       if (isMissing(error)) {
-        return { thread: undefined, latestDraft: undefined, isFinished: false };
+        return { thread: undefined, latestDraft: undefined, isFinished: false, decision: undefined };
       }
       throw error;
     }
@@ -98,6 +100,11 @@ export class ReviewSessions {
   /** Records the draft post_draft posted as the latest one. */
   public async recordDraft(accountId: string, draft: Draft): Promise<void> {
     await this.dex.client.invokeRPC(this.dex.pollerFlow.recordDraft, reviewPollerId(accountId), draft);
+  }
+
+  /** Records the decision a decision tool is about to make, so the poller does not report it as made elsewhere. */
+  public async recordDecision(accountId: string, decision: "approve" | "reject"): Promise<void> {
+    await this.dex.client.invokeRPC(this.dex.pollerFlow.recordDecision, reviewPollerId(accountId), decision);
   }
 
   /** Marks the review finished; a poller that already ended has nothing left to stop. */

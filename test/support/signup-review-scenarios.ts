@@ -292,6 +292,17 @@ export function registerSignupReviewScenarios(setup: SignupReviewScenarioSetup):
     assert.match(threadReplies(sessionId).at(-1)!, /^Approved /);
   });
 
+  test(`${setup.harnessName}: the agent's own approval is never reported as a Dex Cloud admin decision, even after a hold`, async () => {
+    const { accountId, sessionId, thread } = await startReview("heldapproval", 1710000220);
+    await replyAndWait(sessionId, thread, "approve");
+    assert.equal(reviewApi.accountOf(accountId)?.status, "active");
+    await replyAndWait(sessionId, thread, "hold");
+    // Many account checks later the session still waits for `send`.
+    await new Promise((resolve) => setTimeout(resolve, 3_000));
+    assert.equal((await userTexts(sessionId)).filter((text) => text.startsWith("[dex-cloud")).length, 0);
+    assert.equal((await client.describeFlow(sessionId)).status, "running");
+  });
+
   test(`${setup.harnessName}: a confirmation that fails to post leaves the approval as it is`, async () => {
     const { accountId, sessionId, thread } = await startReview("lostpost", 1710000250);
     thread.failNextBotReply();
