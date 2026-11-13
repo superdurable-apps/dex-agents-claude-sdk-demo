@@ -1,4 +1,4 @@
-// The Worker process: the review agent's session Flow, the thread-watch Flow, a Dex Client, and the SignupWatcher.
+// The Worker process: the review agent's session Flow, the review ledger Flow, a Dex Client, and the SignupWatcher.
 
 import { newProjectConnection as newGmailConnection } from "@superdurable/connector-google-gmail";
 import { newProjectConnection as newSlackConnection } from "@superdurable/connector-slack";
@@ -12,7 +12,7 @@ import { ReviewApiClient } from "./review-api.js";
 import { ReviewSessions } from "./review-state.js";
 import type { SignupServices } from "./signup-agent.js";
 import { runSignupWatcher } from "./signup-watcher.js";
-import { SignupThreadWatchFlow } from "./thread-watch-flow.js";
+import { SignupReviewLedgerFlow } from "./review-ledger-flow.js";
 
 const config = loadSignupAgentConfig();
 // DEX_CONNECTOR_CONFIG_FILE names the connector configuration with the Slack and Gmail credentials.
@@ -29,17 +29,17 @@ const services: SignupServices = {
 
 const sessionFlow = createPiSignupAgent(services, piModel(config.piModel));
 let client: Client | undefined;
-const threadWatchFlow = new SignupThreadWatchFlow({
+const ledgerFlow = new SignupReviewLedgerFlow({
   ...services,
   reviewerSlackIds: config.reviewerSlackIds,
   client: () => client!,
   pollIntervalMs: config.threadPollIntervalMs,
 });
-const registry = new Registry([sessionFlow, threadWatchFlow]);
+const registry = new Registry([sessionFlow, ledgerFlow]);
 const blobCache = openBlobCache({ directory: config.dex.blobCacheDirectory, maxBytes: 256 * 1024 * 1024 });
 // The Client exists before the Worker takes Steps, which use it.
 client = new Client(registry, blobCache, config.dex.options);
-services.sessions.connect(client, sessionFlow);
+services.sessions.connect(client, sessionFlow, ledgerFlow);
 const worker = new Worker(registry, blobCache, config.dex.options);
 await worker.start();
 await worker.waitPullRegistered({ timeoutMs: 30_000 });
@@ -47,7 +47,7 @@ console.log(`Signup review agent (${sessionFlow.getFlowType()}) is running on ${
 
 const stopping = new AbortController();
 const watching = runSignupWatcher(
-  { client, sessionFlow, threadWatchFlow, reviewApi: services.reviewApi, reviewSince: config.reviewSince },
+  { client, sessionFlow, ledgerFlow, reviewApi: services.reviewApi, reviewSince: config.reviewSince },
   config.watchIntervalMs,
   stopping.signal,
 );

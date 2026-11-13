@@ -2,18 +2,21 @@
 
 import { setTimeout as sleep } from "node:timers/promises";
 
-import { FlowNotActiveOrNotFoundError, FlowNotFoundError, IdReusePolicy, type Client, type FlowInfo } from "@superdurable/dex";
+import { FlowNotActiveOrNotFoundError, FlowNotFoundError, IdReusePolicy, InitialAttribute, type Client, type FlowInfo } from "@superdurable/dex";
 import { startAgentSession } from "@superdurable/dex-agents";
 
 import type { Account, ReviewApiClient } from "./review-api.js";
-import { relayedReplies, reviewSessionId, threadCursor, threadWatchFlowId, type ReviewSessionFlow } from "./review-state.js";
+import { effects, ledgerRestarts, relayedReplies, reviewLedgerId, reviewSessionId, threadCursor, type ReviewSessionFlow } from "./review-state.js";
+import type { SignupReviewLedgerFlow } from "./review-ledger-flow.js";
 import { firstReviewMessage } from "./signup-agent.js";
-import type { SignupThreadWatchFlow } from "./thread-watch-flow.js";
+
+/** A ledger that keeps ending (such as a Slack app without access) is not started again after this many runs. */
+const maxLedgerRestarts = 3;
 
 export interface SignupWatcherParts {
   readonly client: Client;
   readonly sessionFlow: ReviewSessionFlow;
-  readonly threadWatchFlow: SignupThreadWatchFlow;
+  readonly ledgerFlow: SignupReviewLedgerFlow;
   readonly reviewApi: ReviewApiClient;
   /** Only sign-ups registered at or after this time are reviewed: the backlog before the demo is left alone. */
   readonly reviewSince: Date;
@@ -31,35 +34,48 @@ async function describeOrUndefined(client: Client, flowId: string): Promise<Flow
 }
 
 /**
- * Starts one review: the session (FlowID and Request ID from the account, used IDs never reused, so starting again
- * joins the same run) and, while the session runs, its thread-watch Flow. A watch that ended while the session still
- * runs is started again under a Request ID named after the ended run, carrying its replies and cursor.
+ * Starts one review: its ledger first, since no write tool dispatches without one, then its session. FlowIDs and
+ * Request IDs come from the account, and the session's ID is never reused, so starting again joins the same runs. A
+ * ledger that ended while its session runs is started again, under a Request ID named after the ended run, with that
+ * run's effects, replies and cursor as its initial Attributes.
  */
 async function startReview(parts: SignupWatcherParts, account: Account): Promise<void> {
   const { client } = parts;
   const { accountId } = account;
-  const sessionId = reviewSessionId(accountId);
-  await startAgentSession(client, parts.sessionFlow, sessionId, { initialMessage: firstReviewMessage(account) }, {
-    requestId: accountId,
-    ignoreAlreadyStarted: true,
-    idReusePolicy: IdReusePolicy.DISALLOW,
-  });
-  const watchId = threadWatchFlowId(accountId);
-  const watch = await describeOrUndefined(client, watchId);
-  if (watch?.status === "running" || (await client.describeFlow(sessionId)).status !== "running") {
-    return;
+  const ledgerId = reviewLedgerId(accountId);
+  const [ledger, session] = await Promise.all([describeOrUndefined(client, ledgerId), describeOrUndefined(client, reviewSessionId(accountId))]);
+  const restartable = { ignoreAlreadyStarted: true, idReusePolicy: IdReusePolicy.ALLOW_IF_NOT_RUNNING };
+  if (ledger === undefined) {
+    await client.startFlow(parts.ledgerFlow, ledgerId, { accountId }, { requestId: `${accountId}-ledger`, ...restartable });
+  } else if (ledger.status !== "running" && session?.status === "running") {
+    const [recorded, replies, cursor, restarts] = await client.getAttributes(ledgerId, effects, relayedReplies, threadCursor, ledgerRestarts);
+    if ((restarts ?? 0) >= maxLedgerRestarts) {
+      console.warn(`signup watcher: the ledger of ${accountId} ended ${maxLedgerRestarts + 1} times; it is not started again`);
+      return;
+    }
+    await client.startFlow(parts.ledgerFlow, ledgerId, { accountId, isRestart: true }, {
+      requestId: `${accountId}-ledger-after-${ledger.runId}`,
+      ...restartable,
+      attributes: [
+        InitialAttribute.of(effects, recorded ?? []),
+        InitialAttribute.of(relayedReplies, replies ?? []),
+        InitialAttribute.of(ledgerRestarts, (restarts ?? 0) + 1),
+        ...(cursor === undefined ? [] : [InitialAttribute.of(threadCursor, cursor)]),
+      ],
+    });
   }
-  const [replies, cursor] = watch === undefined ? [undefined, undefined] : await client.getAttributes(watchId, relayedReplies, threadCursor);
-  await client.startFlow(
-    parts.threadWatchFlow,
-    watchId,
-    { accountId, ...(replies === undefined ? {} : { replies }), ...(cursor === undefined ? {} : { cursor }) },
-    { requestId: watch === undefined ? `${accountId}-thread` : `${accountId}-thread-after-${watch.runId}`, ignoreAlreadyStarted: true, idReusePolicy: IdReusePolicy.ALLOW_IF_NOT_RUNNING },
-  );
+  if (session === undefined) {
+    await startAgentSession(client, parts.sessionFlow, reviewSessionId(accountId), { initialMessage: firstReviewMessage(account) }, {
+      requestId: accountId,
+      ignoreAlreadyStarted: true,
+      idReusePolicy: IdReusePolicy.DISALLOW,
+    });
+  }
 }
 
 /**
- * Starts the review of every pending sign-up registered since `reviewSince`.
+ * Starts the review of every pending sign-up registered since `reviewSince`. The ReviewAPI lists the oldest first,
+ * and one round reads at most 10 pages of 100, so at most 1,000 pending sign-ups are looked at per round.
  * @returns The accounts whose start failed, after logging each; the next round tries them again.
  */
 export async function startPendingReviews(parts: SignupWatcherParts): Promise<string[]> {

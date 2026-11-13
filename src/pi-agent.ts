@@ -32,7 +32,7 @@ export function createPiSignupAgent(services: SignupServices, model: ModelClient
           effect: tool.effect,
           // Approval comes from the reviewers in Slack, checked by the tools themselves.
           requiresApproval: false,
-          execute: (args, context) => runSignupTool(tool, args, context.flowId, context.cancellationSignal),
+          execute: (args, context) => runSignupTool(tool, args, { sessionId: context.flowId, callKey: context.idempotencyKey, signal: context.cancellationSignal }),
         }),
       ),
       toolSources: [createSignupConnectorTools(services)],
