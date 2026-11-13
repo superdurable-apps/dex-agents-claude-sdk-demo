@@ -38,10 +38,12 @@ export function createClaudeSignupAgent(
       },
       customTools: tools.map((signupTool) =>
         tool(signupTool.name, signupTool.description, signupTool.schema.shape, async (args, extra) => {
-          // A write runs in its own tool Step, which names the session; a read runs inside the CLI without one.
+          // A write runs in its own tool Step, which names the session and the call; a read runs inside the CLI without them.
           const signal = (extra as { signal?: AbortSignal }).signal ?? new AbortController().signal;
+          const execution = currentDeferredToolExecution();
           try {
-            return { content: [{ type: "text", text: await runSignupTool(signupTool, args, currentDeferredToolExecution()?.flowId, signal) }] };
+            const text = await runSignupTool(signupTool, args, { sessionId: execution?.flowId, callKey: execution?.idempotencyKey, signal });
+            return { content: [{ type: "text", text }] };
           } catch (error: unknown) {
             if (error instanceof ToolExecutionError) {
               return { content: [{ type: "text", text: error.message }], isError: true };

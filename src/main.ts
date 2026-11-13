@@ -28,7 +28,7 @@ const services: SignupServices = {
   harnessLabel: config.harness === "claude-agent-sdk" ? claudeHarnessLabel : piHarnessLabel,
 };
 
-// SIGNUP_AGENT_HARNESS picks the harness; the prompt, the tools and the thread-watch Flow are the same for both.
+// SIGNUP_AGENT_HARNESS picks the harness; the prompt, the tools and the ledger are the same for both.
 const sessionFlow =
   config.harness === "claude-agent-sdk"
     ? createClaudeSignupAgent(services, {
