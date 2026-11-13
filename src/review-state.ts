@@ -2,7 +2,9 @@
 // reviewer reply. Guards decide only from the ledger and the ReviewAPI, never from the session's message history, which
 // the model's output and tool results can shape.
 
-import { Attribute, FlowNotActiveOrNotFoundError, FlowNotFoundError, doubleCodec, jsonCodec, stringCodec, type Client } from "@superdurable/dex";
+import { setTimeout as sleep } from "node:timers/promises";
+
+import { Attribute, FlowNotActiveOrNotFoundError, FlowNotFoundError, RpcLockConflictError, doubleCodec, jsonCodec, stringCodec, type Client } from "@superdurable/dex";
 import {
   readAgentSnapshot,
   sendAgentUserMessage,
@@ -41,9 +43,7 @@ export interface Effect {
   readonly callKey: string;
   readonly tool: string;
   readonly status: "attempted" | "succeeded" | "not_sent";
-  /** What the call does, such as the draft it posts. */
-  readonly payload?: Record<string, unknown> | undefined;
-  /** What it did, such as the Slack message it posted. */
+  /** What it did, kept small: the Slack message's channel, timestamp and user, the draft, the decision. */
   readonly result?: Record<string, unknown> | undefined;
   readonly at: string;
 }
@@ -54,6 +54,8 @@ export const relayedReplies = new Attribute<ReviewerReply[]>("RelayedReplies", j
 export const threadCursor = new Attribute("Cursor", stringCodec);
 /** Ledger state: every effect, in the order of their first record. */
 export const effects = new Attribute<Effect[]>("Effects", jsonCodec({ typeName: "Effects" }));
+/** Ledger state: the Slack page cursor of the newest thread page read; each round reads that one page. */
+export const threadPage = new Attribute("ThreadPage", stringCodec);
 /** Ledger state: how many ledger runs came before this one for the same review. */
 export const ledgerRestarts = new Attribute("Restarts", doubleCodec);
 
@@ -67,8 +69,6 @@ export interface Draft {
 /** The facts of one review, as the ledger has them. */
 export interface ReviewState {
   readonly effects: readonly Effect[];
-  /** The effect already recorded for the call that reads, when it is a retry. */
-  readonly ownEffect?: Effect;
   /** The review's Slack thread, once a review post succeeded, and the bot user that posted it. */
   readonly thread?: { readonly channel: string; readonly ts: string; readonly botUserId: string | undefined };
   /** The newest draft whose post succeeded. */
@@ -89,9 +89,8 @@ export interface ReviewState {
   readonly isFinished: boolean;
 }
 
-/** The facts from the ledger's effects and replies; the effects of `ownCallKey`, a retried call, are left out. */
-export function factsOf(allEffects: readonly Effect[], allReplies: readonly ReviewerReply[], reviewerIds: ReadonlySet<string>, ownCallKey?: string): ReviewState {
-  const recorded = allEffects.filter((effect) => effect.callKey !== ownCallKey);
+/** The facts from the ledger's effects and replies. */
+export function factsOf(recorded: readonly Effect[], allReplies: readonly ReviewerReply[], reviewerIds: ReadonlySet<string>): ReviewState {
   const mayHaveHappened = (effect: Effect) => effect.status === "attempted" || effect.status === "succeeded";
   const reviewPost = recorded.find((effect) => effect.tool === "post_review" && effect.status === "succeeded");
   const reviewMessage = reviewPost?.result?.message as { channelId?: string; timestamp?: string; userId?: string } | undefined;
@@ -114,13 +113,14 @@ export function factsOf(allEffects: readonly Effect[], allReplies: readonly Revi
   }
   const unconfirmedReviewPost = reviewPost === undefined ? recorded.find((effect) => effect.tool === "post_review" && effect.status === "attempted") : undefined;
   const decided = (tool: string, status: string) => recorded.some((effect) => effect.tool === tool && effect.status === "succeeded" && effect.result?.status === status);
-  const ownEffect = ownCallKey === undefined ? undefined : allEffects.find((effect) => effect.callKey === ownCallKey);
   return {
     effects: recorded,
-    ...(ownEffect === undefined ? {} : { ownEffect }),
     ...(reviewMessage?.timestamp ? { thread: { channel: String(reviewMessage.channelId), ts: reviewMessage.timestamp, botUserId: reviewMessage.userId } } : {}),
     ...(latestDraft === undefined ? {} : { latestDraft }),
-    draftAttempts: recorded.filter((effect) => (effect.tool === "post_review" || effect.tool === "post_draft") && mayHaveHappened(effect)).length,
+    // The review post is draft 1 however many calls it took; each post_draft that may have gone out is the next.
+    draftAttempts:
+      (recorded.some((effect) => effect.tool === "post_review" && mayHaveHappened(effect)) ? 1 : 0) +
+      recorded.filter((effect) => effect.tool === "post_draft" && mayHaveHappened(effect)).length,
     hasUnconfirmedNewerDraft,
     ...(unconfirmedReviewPost === undefined ? {} : { unconfirmedReviewPostAt: unconfirmedReviewPost.at }),
     replies,
@@ -139,7 +139,7 @@ export class MissingLedgerError extends Error {}
 export class ReviewSessions {
   private connected: { client: Client; sessionFlow: ReviewSessionFlow; ledgerFlow: SignupReviewLedgerFlow } | undefined;
 
-  public constructor(private readonly reviewerIds: ReadonlySet<string>) {}
+  public constructor(public readonly reviewerIds: ReadonlySet<string>) {}
 
   public connect(client: Client, sessionFlow: ReviewSessionFlow, ledgerFlow: SignupReviewLedgerFlow): void {
     this.connected = { client, sessionFlow, ledgerFlow };
@@ -152,11 +152,11 @@ export class ReviewSessions {
     return this.connected;
   }
 
-  /** The review's facts from its ledger; `ownCallKey` leaves out a retried call's own effects. */
-  public async read(accountId: string, ownCallKey?: string): Promise<ReviewState> {
+  /** The review's facts from its ledger. */
+  public async read(accountId: string): Promise<ReviewState> {
     try {
       const [recorded, replies] = await this.dex.client.getAttributes(reviewLedgerId(accountId), effects, relayedReplies);
-      return factsOf(recorded ?? [], replies ?? [], this.reviewerIds, ownCallKey);
+      return factsOf(recorded ?? [], replies ?? [], this.reviewerIds);
     } catch (error: unknown) {
       if (error instanceof FlowNotFoundError || error instanceof FlowNotActiveOrNotFoundError) {
         throw new MissingLedgerError(`the review ledger ${reviewLedgerId(accountId)} does not exist`);
@@ -167,7 +167,7 @@ export class ReviewSessions {
 
   /** Records an effect in the review's ledger; a failure means nothing may be dispatched. */
   public async record(accountId: string, effect: Omit<Effect, "at">): Promise<void> {
-    await this.dex.client.invokeRPC(this.dex.ledgerFlow.recordEffect, reviewLedgerId(accountId), effect);
+    await retryOnLockConflict(() => this.dex.client.invokeRPC(this.dex.ledgerFlow.recordEffect, reviewLedgerId(accountId), effect));
   }
 
   public snapshot(accountId: string): Promise<AgentSnapshot> {
@@ -192,6 +192,20 @@ export class ReviewSessions {
       (snapshot.queuedMessages ?? []).some((pending) => pending.message.text.startsWith(marker));
     if (!isThere) {
       await sendAgentUserMessage(client, sessionFlow, sessionId, { text: `${marker} ${text}` });
+    }
+  }
+}
+
+/** Runs `work`, retrying up to 4 times with a growing pause when another RPC holds the ledger's lock. */
+export async function retryOnLockConflict<T>(work: () => Promise<T>): Promise<T> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await work();
+    } catch (error: unknown) {
+      if (!(error instanceof RpcLockConflictError) || attempt >= 4) {
+        throw error;
+      }
+      await sleep(100 * 2 ** attempt);
     }
   }
 }

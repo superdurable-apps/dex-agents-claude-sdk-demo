@@ -37,6 +37,7 @@ import {
   relayedReplies,
   reviewSessionId,
   threadCursor,
+  threadPage,
   type Effect,
   type ReviewSessions,
   type ReviewerReply,
@@ -50,9 +51,17 @@ export interface LedgerInput {
 
 /** The account status already reported to the session as `[dex-cloud <status>]`. */
 const reportedStatus = new Attribute("ReportedStatus", stringCodec);
+export const reportedStatusForTest = reportedStatus;
 const maxRecordedReplies = 500;
-const maxEffects = 500;
-const roundTimeoutMs = 40_000;
+/** Bounds the Effects Attribute, which holds each posted draft once. */
+const maxEffectsBytes = 256 * 1024;
+const heartbeatTimeoutMs = 60_000;
+/** At most the heartbeat timeout minus 10 seconds, with a round's 40 seconds included. */
+const heartbeatEveryMs = 15_000;
+/** A ledger that ended this way before its session existed; the watcher cancels such a session. */
+export const noSessionStarted = "no session started";
+/** Tools whose effect may happen once per review: a second attempt is refused under the ledger's lock. */
+const onceOnlyTools = new Set(["post_review", "send_welcome_email"]);
 
 export interface LedgerSettings {
   readonly sessions: ReviewSessions;
@@ -65,6 +74,8 @@ export interface LedgerSettings {
   /** Every this many rounds the account is read too. */
   readonly accountCheckEveryRounds?: number;
   readonly maxReviewAgeMs?: number;
+  /** A round longer than this is abandoned and skipped; 40 seconds by default. */
+  readonly roundTimeoutMs?: number;
 }
 
 /** Failures that skip one round instead of failing the Step: back-pressure, Dex hiccups, network, a slow round. */
@@ -99,18 +110,30 @@ function within<T>(ms: number, work: Promise<T>): Promise<T> {
   return Promise.race([work, sleep(ms).then(() => Promise.reject(Object.assign(new Error(`a round took over ${ms} ms`), { name: "TimeoutError" })))]);
 }
 
+/** What one round found; the Execute applies it, so a round abandoned by its timeout writes nothing. */
+type RoundResult =
+  | { readonly kind: "idle" }
+  | { readonly kind: "complete"; readonly reason: string }
+  | { readonly kind: "finished" }
+  | { readonly kind: "note"; readonly note: string }
+  | { readonly kind: "relay"; readonly fresh: ReviewerReply[]; readonly page: string | undefined }
+  | { readonly kind: "page"; readonly page: string }
+  | { readonly kind: "report"; readonly status: string };
+
 // dex:group group-id:relay group-label:"Relay"
-// dex:explanation text:"Polls the review thread, records new reviewer replies, and ends with the review."
+// dex:explanation text:"Polls the review thread one page a round, records new reviewer replies, and ends with the review."
 class WatchThread implements Step<LedgerInput> {
   private readonly pollIntervalMs: number;
   private readonly accountCheckEveryRounds: number;
   private readonly maxReviewAgeMs: number;
+  private readonly roundTimeoutMs: number;
 
   public constructor(private readonly settings: LedgerSettings) {
-    // A round and its sleep stay well inside the one-minute heartbeat timeout.
-    this.pollIntervalMs = Math.min(settings.pollIntervalMs ?? 15_000, 40_000);
-    this.accountCheckEveryRounds = settings.accountCheckEveryRounds ?? 4;
+    // Slack allows a non-Marketplace app about one conversations.replies call a minute.
+    this.pollIntervalMs = settings.pollIntervalMs ?? 60_000;
+    this.accountCheckEveryRounds = settings.accountCheckEveryRounds ?? 1;
     this.maxReviewAgeMs = settings.maxReviewAgeMs ?? 7 * 24 * 60 * 60_000;
+    this.roundTimeoutMs = settings.roundTimeoutMs ?? 40_000;
   }
 
   public getStepType(): string {
@@ -119,11 +142,16 @@ class WatchThread implements Step<LedgerInput> {
 
   public getStepOptions(): StepOptions {
     const maxWaitMs = this.maxReviewAgeMs + 60 * 60_000;
-    // Transient failures stay inside the loop; a crash retries until the review's time is up, then the failure route.
-    return { executeMethodTimeoutMs: maxWaitMs, heartbeatTimeoutMs: 60_000, executeRetry: { totalDurationMs: maxWaitMs }, executeFailure: ExecuteFailure.proceedTo(PostWatchNote) };
+    // Transient failures stay inside the loop; these attempts are for crashes, then the failure route.
+    return {
+      executeMethodTimeoutMs: maxWaitMs,
+      heartbeatTimeoutMs: heartbeatTimeoutMs,
+      executeRetry: { maximumAttempts: 4, totalDurationMs: maxWaitMs },
+      executeFailure: ExecuteFailure.proceedTo(PostWatchNote),
+    };
   }
 
-  /** Returns after each new batch of replies, so they and the cursor commit before ForwardReplies sends them. */
+  /** Returns after each new batch of replies, so they and the cursors commit before ForwardReplies sends them. */
   public async execute(context: AsyncContext, input: LedgerInput): Promise<StepDecision> {
     if (input.isRestart) {
       return goTo(ForwardReplies, { accountId: input.accountId, fresh: relayedReplies.get(context) ?? [] });
@@ -131,69 +159,109 @@ class WatchThread implements Step<LedgerInput> {
     let delayMs = this.pollIntervalMs;
     for (let round = 1; ; round++) {
       await context.recordHeartbeat(round);
+      let result: RoundResult;
       try {
-        const decision = await within(roundTimeoutMs, this.round(context, input, round));
-        if (decision !== undefined) {
-          return decision;
-        }
+        result = await within(this.roundTimeoutMs, this.round(context, input, round));
         delayMs = this.pollIntervalMs;
       } catch (error: unknown) {
         if (!isTransient(error, context)) {
           throw error;
         }
         console.warn(`review ledger ${context.flowId}: skipped a round: ${describe(error)}`);
-        delayMs = Math.min(delayMs * 2, 40_000);
+        result = { kind: "idle" };
+        delayMs = Math.min(delayMs * 2, 5 * 60_000);
       }
-      for (let slept = 0; slept < delayMs; slept += 15_000) {
-        await sleep(Math.min(15_000, delayMs - slept), undefined, { signal: context.cancellationSignal });
+      const decision = await this.apply(context, input, result);
+      if (decision !== undefined) {
+        return decision;
+      }
+      // Heartbeats stay well inside the heartbeat timeout, however long the pause.
+      for (let slept = 0; slept < delayMs; slept += heartbeatEveryMs) {
         await context.recordHeartbeat(round);
+        await sleep(Math.min(heartbeatEveryMs, delayMs - slept), undefined, { signal: context.cancellationSignal });
       }
     }
   }
 
-  private async round(context: AsyncContext, input: LedgerInput, round: number): Promise<StepDecision | undefined> {
+  /** Writes what a round found: Attributes, the session, and the next Step. */
+  private async apply(context: AsyncContext, input: LedgerInput, result: RoundResult): Promise<StepDecision | undefined> {
+    const sessionId = reviewSessionId(input.accountId);
+    switch (result.kind) {
+      case "idle":
+        return undefined;
+      case "complete":
+        return gracefulComplete(result.reason);
+      case "finished":
+        await stopSession(this.settings.client(), sessionId, "review finished");
+        return gracefulComplete("review finished");
+      case "note":
+        return goTo(PostWatchNote, { ...input, note: result.note });
+      case "relay":
+        relayedReplies.set(context, [...(relayedReplies.get(context) ?? []), ...result.fresh].slice(-maxRecordedReplies));
+        threadCursor.set(context, result.fresh.at(-1)!.ts);
+        if (result.page !== undefined) {
+          threadPage.set(context, result.page);
+        }
+        return goTo(ForwardReplies, { accountId: input.accountId, fresh: result.fresh });
+      case "page":
+        threadPage.set(context, result.page);
+        return goTo(WatchThread, { accountId: input.accountId });
+      case "report":
+        await this.settings.sessions.sendOnce(input.accountId, `[dex-cloud ${result.status}]`, "The account was decided in Dex Cloud admin.");
+        reportedStatus.set(context, result.status);
+        return goTo(WatchThread, { accountId: input.accountId });
+    }
+  }
+
+  /** Reads and decides only; it writes nothing, so a round its timeout abandons leaves no trace. */
+  private async round(context: AsyncContext, input: LedgerInput, round: number): Promise<RoundResult> {
     const { sessions, reviewApi } = this.settings;
     const sessionId = reviewSessionId(input.accountId);
-    const client = this.settings.client();
-    const session = await client.describeFlow(sessionId).catch((error: unknown) => {
-      if (error instanceof FlowNotFoundError || error instanceof FlowNotActiveOrNotFoundError) {
-        return undefined;
-      }
-      throw error;
-    });
+    const session = await this.settings
+      .client()
+      .describeFlow(sessionId)
+      .catch((error: unknown) => {
+        if (error instanceof FlowNotFoundError || error instanceof FlowNotActiveOrNotFoundError) {
+          return undefined;
+        }
+        throw error;
+      });
     if (session === undefined) {
       // The watcher starts the session right after this ledger; until then there is nothing to watch.
-      return Date.now() - context.flowStartedAt.getTime() > this.maxReviewAgeMs ? gracefulComplete("no session started") : undefined;
+      return Date.now() - context.flowStartedAt.getTime() > this.maxReviewAgeMs ? { kind: "complete", reason: noSessionStarted } : { kind: "idle" };
     }
     if (session.status === "failed") {
-      return goTo(PostWatchNote, { ...input, note: "The agent session failed, so this review stops here." });
+      return { kind: "note", note: "The agent session failed, so this review stops here." };
     }
     if (session.status !== "running") {
-      return gracefulComplete("the session ended");
+      return { kind: "complete", reason: "the session ended" };
     }
     if (Date.now() - session.startedAt.getTime() > this.maxReviewAgeMs) {
-      return goTo(PostWatchNote, { ...input, note: "No decision arrived within 7 days, so this review stops here." });
+      return { kind: "note", note: "No decision arrived within 7 days, so this review stops here." };
     }
     // The ledger's own committed effects: an RPC may have recorded some since this Execute started.
     const state = await sessions.read(input.accountId);
     const snapshot = await sessions.snapshot(input.accountId);
     if (state.isFinished && snapshot.state?.status === "waiting_for_user_message" && snapshot.queuedMessageCount === 0) {
-      await stopSession(client, sessionId, "review finished");
-      return gracefulComplete("review finished");
+      return { kind: "finished" };
     }
     if (snapshot.state?.status === "failed") {
-      return goTo(PostWatchNote, { ...input, note: `The agent session failed (${(snapshot.state.lastTurnError ?? "no detail").slice(0, 200)}), so this review stops here.` });
+      return { kind: "note", note: `The agent session failed (${(snapshot.state.lastTurnError ?? "no detail").slice(0, 200)}), so this review stops here.` };
     }
     if (state.thread !== undefined) {
+      const page = threadPage.get(context);
+      const { messages, nextCursor } = await this.readThreadPage(context, state.thread, page);
       const after = threadCursor.get(context) ?? state.thread.ts;
-      const fresh = (await this.readThread(context, state.thread))
+      const fresh = messages
         .filter((message) => isLater(message.timestamp, after) && message.userId !== undefined && message.userId !== state.thread?.botUserId)
         .filter((message) => this.settings.reviewerSlackIds.has(message.userId!))
         .map((message) => ({ ts: message.timestamp, userId: message.userId!, text: message.text.trim() }));
+      // A page with a next page is full: the next round reads the next one. The last page is read again for new replies.
       if (fresh.length > 0) {
-        relayedReplies.set(context, [...(relayedReplies.get(context) ?? []), ...fresh].slice(-maxRecordedReplies));
-        threadCursor.set(context, fresh.at(-1)!.ts);
-        return goTo(ForwardReplies, { accountId: input.accountId, fresh });
+        return { kind: "relay", fresh, page: nextCursor };
+      }
+      if (nextCursor !== undefined) {
+        return { kind: "page", page: nextCursor };
       }
     }
     if (round % this.accountCheckEveryRounds === 0 && !state.isApprovedHere && !state.isRejectedHere && reportedStatus.get(context) === undefined) {
@@ -201,32 +269,21 @@ class WatchThread implements Step<LedgerInput> {
       // A status the reviewers' own decision explains is this review's decision on its way, not one made elsewhere.
       const isOwnDecision = (state.decision === "approve" && account.status === "active") || (state.decision === "reject" && account.status === "rejected");
       if (account.status !== "pending_approval" && !isOwnDecision) {
-        await sessions.sendOnce(input.accountId, `[dex-cloud ${account.status}]`, "The account was decided in Dex Cloud admin.");
-        reportedStatus.set(context, account.status);
-        return goTo(WatchThread, { accountId: input.accountId });
+        return { kind: "report", status: account.status };
       }
     }
-    return undefined;
+    return { kind: "idle" };
   }
 
-  /** The thread's messages, oldest first, at most 20 pages of 15, read with the Slack connector inside this Step. */
-  private async readThread(context: AsyncContext, thread: { channel: string; ts: string }): Promise<SlackMessage[]> {
+  /** One page of the thread (15 messages), at `page` or from the start, read with the Slack connector inside this Step. */
+  private async readThreadPage(context: AsyncContext, thread: { channel: string; ts: string }, page: string | undefined) {
     const operation = this.settings.slack.operations.listThreadMessages();
     const call = createCall(context, this.settings.slack.reference, operation.definition().operation);
-    const messages: SlackMessage[] = [];
-    let pageCursor: string | undefined;
-    for (let page = 0; page < 20; page++) {
-      const result = await runQuery(operation, call, { channelId: thread.channel, threadTimestamp: thread.ts, pageSize: 15, ...(pageCursor ? { cursor: pageCursor } : {}) });
-      if (result.branch !== "read") {
-        throw new Error(`reading the Slack thread ended ${result.branch}: ${result.failure?.message ?? ""}`);
-      }
-      messages.push(...(result.value.messages ?? []));
-      pageCursor = result.value.nextCursor;
-      if (!pageCursor) {
-        break;
-      }
+    const result = await runQuery(operation, call, { channelId: thread.channel, threadTimestamp: thread.ts, pageSize: 15, ...(page ? { cursor: page } : {}) });
+    if (result.branch !== "read") {
+      throw new Error(`reading the Slack thread ended ${result.branch}: ${result.failure?.message ?? ""}`);
     }
-    return messages;
+    return { messages: result.value.messages ?? [], nextCursor: result.value.nextCursor || undefined };
   }
 }
 
@@ -305,12 +362,13 @@ export class SignupReviewLedgerFlow implements Flow<LedgerInput> {
   }
 
   public getPersistenceSchema(): PersistenceSchema {
-    return { attributes: [effects, relayedReplies, threadCursor, reportedStatus, ledgerRestarts] };
+    return { attributes: [effects, relayedReplies, threadCursor, threadPage, reportedStatus, ledgerRestarts] };
   }
 
   /**
-   * Records one effect under its call key. `attempted` adds the effect once; `succeeded` completes it; `not_sent`
-   * applies only to an attempted effect, with the caller's proof. A succeeded effect never changes.
+   * Records one effect under its call key. `attempted` adds the effect once, and is refused for a once-only tool that
+   * already has an effect that may have happened; `succeeded` completes an effect; `not_sent` applies only to an
+   * attempted one, with the caller's proof. A succeeded effect never changes.
    */
   public recordEffect(context: Context, effect: Omit<Effect, "at">): void {
     const recorded = effects.get(context) ?? [];
@@ -319,11 +377,19 @@ export class SignupReviewLedgerFlow implements Flow<LedgerInput> {
     if (existing?.status === "succeeded" || (existing !== undefined && effect.status === "attempted")) {
       return;
     }
-    if (existing === undefined && recorded.length >= maxEffects) {
-      throw new Error(`the review ledger holds its maximum of ${maxEffects} effects`);
+    if (effect.status === "not_sent" && existing?.status !== "attempted") {
+      throw new Error(`not_sent needs an attempted effect for ${effect.callKey}`);
     }
-    const next: Effect = { ...existing, ...effect, payload: effect.payload ?? existing?.payload, at: existing?.at ?? new Date().toISOString() };
-    effects.set(context, existing === undefined ? [...recorded, next] : recorded.map((candidate, at) => (at === index ? next : candidate)));
+    const mayHaveHappened = (candidate: Effect) => candidate.status === "attempted" || candidate.status === "succeeded";
+    if (effect.status === "attempted" && onceOnlyTools.has(effect.tool) && recorded.some((candidate) => candidate.tool === effect.tool && mayHaveHappened(candidate))) {
+      throw new Error(`${effect.tool} may already have happened in this review; it happens at most once`);
+    }
+    const next: Effect = { ...existing, ...effect, at: existing?.at ?? new Date().toISOString() };
+    const updated = existing === undefined ? [...recorded, next] : recorded.map((candidate, at) => (at === index ? next : candidate));
+    if (JSON.stringify(updated).length > maxEffectsBytes) {
+      throw new Error(`the review ledger holds its maximum of ${maxEffectsBytes} bytes of effects`);
+    }
+    effects.set(context, updated);
   }
 }
 

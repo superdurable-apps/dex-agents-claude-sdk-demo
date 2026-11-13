@@ -63,6 +63,6 @@ export function loadSignupAgentConfig(environment: NodeJS.ProcessEnv = process.e
     claudeModel: optional("SIGNUP_AGENT_CLAUDE_MODEL") ?? "claude-opus-5-5",
     githubToken: optional("GITHUB_TOKEN"),
     watchIntervalMs: positiveInteger(optional("SIGNUP_WATCH_INTERVAL_SECONDS") ?? "30", "SIGNUP_WATCH_INTERVAL_SECONDS") * 1_000,
-    threadPollIntervalMs: positiveInteger(optional("SIGNUP_THREAD_POLL_SECONDS") ?? "15", "SIGNUP_THREAD_POLL_SECONDS") * 1_000,
+    threadPollIntervalMs: positiveInteger(optional("SIGNUP_THREAD_POLL_SECONDS") ?? "60", "SIGNUP_THREAD_POLL_SECONDS") * 1_000,
   };
 }
