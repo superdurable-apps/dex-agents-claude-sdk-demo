@@ -167,6 +167,7 @@ You need Node.js 22.19 or later (24 recommended, `.nvmrc`) and
 | `GITHUB_TOKEN` | Optional, raises the GitHub API rate limit |
 | `SIGNUP_REVIEW_SINCE` | Required. RFC 3339 time, such as `2026-11-13T00:00:00Z`: only sign-ups registered since then are reviewed |
 | `SIGNUP_WATCH_INTERVAL_SECONDS`, `SIGNUP_THREAD_POLL_SECONDS` | Seconds between reads of the pending sign-ups (30) and of each thread (60; Slack may allow a non-Marketplace app one thread read a minute) |
+| `SIGNUP_WORKER_SLOTS` | The Worker's execution slots (64); each open review's ledger holds one |
 
 ## Tests
 
@@ -215,10 +216,10 @@ of adversarial HTML.
   Decisions are not affected, since the guards read the ledger's `RelayedReplies`; at worst the agent posts one
   extra draft.
 - Every review finishes within 7 days, or its ledger stops it.
-- Each open review's ledger holds one Worker slot while it polls (one long-running Step). A Worker has
-  as many slots as logical CPUs by default, so with that many open reviews no slot is left for the
-  sessions; run more Workers, or raise `maxConcurrentTasks`, before reviewing more sign-ups at once.
-  A Slack thread-reply Trigger would remove this limit.
+- Each open review's ledger holds one Worker slot while it polls (one long-running Step). The Worker
+  has `SIGNUP_WORKER_SLOTS` slots (64), so with that many open reviews no slot is left for the
+  sessions; raise it (up to the Dex server's per-Worker cap) or run more Workers before reviewing more
+  sign-ups at once. A Slack thread-reply Trigger would remove this limit.
 - The ReviewAPI lists pending sign-ups oldest first, and a round reads at most 10 pages of 100: with a
   backlog of more than 1,000 older pending sign-ups, newer ones are not reached. `SIGNUP_REVIEW_SINCE`
   only filters what a round read.

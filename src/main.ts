@@ -40,7 +40,7 @@ const blobCache = openBlobCache({ directory: config.dex.blobCacheDirectory, maxB
 // The Client exists before the Worker takes Steps, which use it.
 client = new Client(registry, blobCache, config.dex.options);
 services.sessions.connect(client, sessionFlow, ledgerFlow);
-const worker = new Worker(registry, blobCache, config.dex.options);
+const worker = new Worker(registry, blobCache, { ...config.dex.options, pull: { maxConcurrentTasks: config.workerSlots } });
 await worker.start();
 await worker.waitPullRegistered({ timeoutMs: 30_000 });
 console.log(`Signup review agent (${sessionFlow.getFlowType()}) is running on ${config.dex.options.serverAddress}`);

@@ -20,6 +20,8 @@ export interface SignupAgentConfig {
   /** Only sign-ups registered at or after this time are reviewed. */
   readonly reviewSince: Date;
   readonly threadPollIntervalMs: number;
+  /** The Worker's execution slots: each open review's ledger holds one while it polls. */
+  readonly workerSlots: number;
 }
 
 /** SIGNUP_REVIEW_SINCE is required, so a first start never reviews the whole backlog of pending sign-ups. */
@@ -31,9 +33,9 @@ function reviewSince(value: string): Date {
   return since;
 }
 
-function positiveInteger(value: string, name: string): number {
+function positiveInteger(value: string, name: string, unit = "seconds"): number {
   if (!/^[1-9]\d{0,5}$/.test(value)) {
-    throw new Error(`${name} must be a positive whole number of seconds`);
+    throw new Error(`${name} must be a positive whole number of ${unit}`);
   }
   return Number(value);
 }
@@ -64,5 +66,6 @@ export function loadSignupAgentConfig(environment: NodeJS.ProcessEnv = process.e
     githubToken: optional("GITHUB_TOKEN"),
     watchIntervalMs: positiveInteger(optional("SIGNUP_WATCH_INTERVAL_SECONDS") ?? "30", "SIGNUP_WATCH_INTERVAL_SECONDS") * 1_000,
     threadPollIntervalMs: positiveInteger(optional("SIGNUP_THREAD_POLL_SECONDS") ?? "60", "SIGNUP_THREAD_POLL_SECONDS") * 1_000,
+    workerSlots: positiveInteger(optional("SIGNUP_WORKER_SLOTS") ?? "64", "SIGNUP_WORKER_SLOTS", "slots"),
   };
 }
