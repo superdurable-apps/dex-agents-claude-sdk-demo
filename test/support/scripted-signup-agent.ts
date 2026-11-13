@@ -2,7 +2,11 @@
 
 import type { GitHubUserSummary, ProfilePage, ProfileSources } from "../../src/profile-sources.js";
 
-export type ScriptedStep = { readonly kind: "answer"; readonly text: string } | { readonly kind: "tool"; readonly name: string; readonly arguments: Record<string, unknown> };
+/** One scripted model response: an answer, tool calls (several in one response when asked), or a failed call. */
+export type ScriptedStep =
+  | { readonly kind: "answer"; readonly text: string }
+  | { readonly kind: "tools"; readonly calls: readonly { readonly name: string; readonly arguments: Record<string, unknown> }[] }
+  | { readonly kind: "fail" };
 
 /** A tool result the model has seen since the last user message. */
 export interface SeenResult {
@@ -16,13 +20,25 @@ export const rejectedApplicantWord = "spammy";
 export const passiveApplicantWord = "passive";
 /** The GitHub login whose profile carries a prompt injection. */
 export const injectingLogin = "injector";
+/** Applicants whose email contains this word make the model ask for two tools in one response. */
+export const multiCallApplicantWord = "multi";
+/** Applicants whose email contains this word make the model call fail right after the email was sent. */
+export const crashingApplicantWord = "crash";
 
-/** Calls each tool of `plan` in turn, skipping the ones already called since the user message, then answers. */
+/** Runs each response of `plan` in turn, skipping the calls already made since the user message, then answers. */
 function follow(plan: readonly ScriptedStep[], seen: readonly SeenResult[]): ScriptedStep {
-  return plan[seen.length] ?? { kind: "answer", text: "Done." };
+  let made = 0;
+  for (const step of plan) {
+    if (made >= seen.length) {
+      return step;
+    }
+    made += step.kind === "tools" ? step.calls.length : 1;
+  }
+  return { kind: "answer", text: "Done." };
 }
 
-const tool = (name: string, args: Record<string, unknown> = {}): ScriptedStep => ({ kind: "tool", name, arguments: args });
+const tool = (name: string, args: Record<string, unknown> = {}): ScriptedStep => ({ kind: "tools", calls: [{ name, arguments: args }] });
+const tools = (...steps: ScriptedStep[]): ScriptedStep => ({ kind: "tools", calls: steps.flatMap((step) => (step.kind === "tools" ? step.calls : [])) });
 
 /** Decides the next step from the session's user messages, oldest first, and the tool results since the last one. */
 export function decideNextStep(userTexts: readonly string[], seen: readonly SeenResult[]): ScriptedStep {
@@ -47,6 +63,7 @@ export function decideNextStep(userTexts: readonly string[], seen: readonly Seen
     return follow([...plan, ...(firstPost !== undefined && !firstPost.output.includes('"timestamp"') ? [review] : [])], seen);
   }
   const isPassive = email.includes(passiveApplicantWord);
+  const isMulti = email.includes(multiCallApplicantWord);
   const slack = /^\[slack [\d.]+\] <@\w+>: ([\s\S]*)$/.exec(userText)?.[1];
   if (slack !== undefined && isPassive) {
     return { kind: "answer", text: "Noted." };
@@ -58,6 +75,12 @@ export function decideNextStep(userTexts: readonly string[], seen: readonly Seen
   if (reply?.startsWith("reject")) {
     const isRejected = seen[0]?.output.includes('"rejected"') === true;
     return follow([tool("reject_account"), tool("reply_in_thread", { text: `reject_account: ${seen[0]?.output ?? ""}` }), ...(isRejected ? [tool("finish_review")] : [])], seen);
+  }
+  if ((reply === "send" || reply === "send now") && isMulti) {
+    return follow([tools(tool("send_welcome_email"), tool("reply_in_thread", { text: "Sending the email." }))], seen);
+  }
+  if ((reply === "send" || reply === "send now") && email.includes(crashingApplicantWord)) {
+    return follow([tool("send_welcome_email"), { kind: "fail" }], seen);
   }
   if (reply === "send" || reply === "send now") {
     const result = seen[0]?.output ?? "";
@@ -71,8 +94,12 @@ export function decideNextStep(userTexts: readonly string[], seen: readonly Seen
   if (userText.startsWith("[dex-cloud")) {
     return follow([tool("reply_in_thread", { text: "Decided in Dex Cloud admin; nothing more to do." }), tool("finish_review")], seen);
   }
+  if (reply === "hold") {
+    return { kind: "answer", text: "Holding." };
+  }
   if (reply !== undefined) {
-    return follow([tool("post_draft", { subject: "Welcome to Dex Cloud", body: `Hi Ada,\n\nWelcome to Dex Cloud. Revised: ${reply}\n\nThe Dex Cloud team` })], seen);
+    const draft = tool("post_draft", { subject: "Welcome to Dex Cloud", body: `Hi Ada,\n\nWelcome to Dex Cloud. Revised: ${reply}\n\nThe Dex Cloud team` });
+    return follow([isMulti ? tools(draft, tool("reply_in_thread", { text: "Here is the new draft." })) : draft], seen);
   }
   return { kind: "answer", text: "ok" };
 }

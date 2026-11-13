@@ -9,7 +9,10 @@ import { registerSignupReviewScenarios } from "./support/signup-review-scenarios
 const scriptedModel = new ScriptedModelClient((request) => {
   const seen = ScriptedModelClient.toolResults(request).map((result) => ({ name: result.toolName, output: result.output }));
   const step = decideNextStep(ScriptedModelClient.userTexts(request), seen);
-  return step.kind === "answer" ? { text: step.text } : { toolCalls: [{ toolName: step.name, arguments: step.arguments }] };
+  if (step.kind === "fail") {
+    throw new Error("scripted model failure");
+  }
+  return step.kind === "answer" ? { text: step.text } : { toolCalls: step.calls.map((call) => ({ toolName: call.name, arguments: call.arguments })) };
 });
 
 registerSignupReviewScenarios({ harnessName: "pi", createFlow: (services) => createPiSignupAgent(services, scriptedModel) });
