@@ -107,7 +107,7 @@ async function stopSession(client: Client, sessionId: string, reason: string): P
 
 /** Rejects with a TimeoutError when `work` takes longer than `ms`; the work itself is abandoned. */
 function within<T>(ms: number, work: Promise<T>): Promise<T> {
-  return Promise.race([work, sleep(ms).then(() => Promise.reject(Object.assign(new Error(`a round took over ${ms} ms`), { name: "TimeoutError" })))]);
+  return Promise.race([work, sleep(ms).then(() => Promise.reject(new DOMException(`a round took over ${ms} ms`, "TimeoutError")))]);
 }
 
 /** What one round found; the Execute applies it, so a round abandoned by its timeout writes nothing. */
@@ -171,45 +171,37 @@ class WatchThread implements Step<LedgerInput> {
         result = { kind: "idle" };
         delayMs = Math.min(delayMs * 2, 5 * 60_000);
       }
-      const decision = await this.apply(context, input, result);
-      if (decision !== undefined) {
-        return decision;
+      // Each decision is returned directly, so dexcli visualize can read the Step's transitions.
+      switch (result.kind) {
+        case "idle":
+          break;
+        case "complete":
+          return gracefulComplete(result.reason);
+        case "finished":
+          await stopSession(this.settings.client(), reviewSessionId(input.accountId), "review finished");
+          return gracefulComplete("review finished");
+        case "note":
+          return goTo(PostWatchNote, { ...input, note: result.note });
+        case "relay":
+          relayedReplies.set(context, [...(relayedReplies.get(context) ?? []), ...result.fresh].slice(-maxRecordedReplies));
+          threadCursor.set(context, result.fresh.at(-1)!.ts);
+          if (result.page !== undefined) {
+            threadPage.set(context, result.page);
+          }
+          return goTo(ForwardReplies, { accountId: input.accountId, fresh: result.fresh });
+        case "page":
+          threadPage.set(context, result.page);
+          return goTo(WatchThread, { accountId: input.accountId });
+        case "report":
+          await this.settings.sessions.sendOnce(input.accountId, `[dex-cloud ${result.status}]`, "The account was decided in Dex Cloud admin.");
+          reportedStatus.set(context, result.status);
+          return goTo(WatchThread, { accountId: input.accountId });
       }
       // Heartbeats stay well inside the heartbeat timeout, however long the pause.
       for (let slept = 0; slept < delayMs; slept += heartbeatEveryMs) {
         await context.recordHeartbeat(round);
         await sleep(Math.min(heartbeatEveryMs, delayMs - slept), undefined, { signal: context.cancellationSignal });
       }
-    }
-  }
-
-  /** Writes what a round found: Attributes, the session, and the next Step. */
-  private async apply(context: AsyncContext, input: LedgerInput, result: RoundResult): Promise<StepDecision | undefined> {
-    const sessionId = reviewSessionId(input.accountId);
-    switch (result.kind) {
-      case "idle":
-        return undefined;
-      case "complete":
-        return gracefulComplete(result.reason);
-      case "finished":
-        await stopSession(this.settings.client(), sessionId, "review finished");
-        return gracefulComplete("review finished");
-      case "note":
-        return goTo(PostWatchNote, { ...input, note: result.note });
-      case "relay":
-        relayedReplies.set(context, [...(relayedReplies.get(context) ?? []), ...result.fresh].slice(-maxRecordedReplies));
-        threadCursor.set(context, result.fresh.at(-1)!.ts);
-        if (result.page !== undefined) {
-          threadPage.set(context, result.page);
-        }
-        return goTo(ForwardReplies, { accountId: input.accountId, fresh: result.fresh });
-      case "page":
-        threadPage.set(context, result.page);
-        return goTo(WatchThread, { accountId: input.accountId });
-      case "report":
-        await this.settings.sessions.sendOnce(input.accountId, `[dex-cloud ${result.status}]`, "The account was decided in Dex Cloud admin.");
-        reportedStatus.set(context, result.status);
-        return goTo(WatchThread, { accountId: input.accountId });
     }
   }
 
