@@ -71,26 +71,64 @@ fence, so a crash never posts or sends twice. A send is never repeated: a provid
 dispatch does not prove that no email went out, so the send stays `attempted`, and the agent says in
 the thread to check Sent Mail and, if nothing went out, to send the email manually.
 
-## The harness
+## The two harnesses
 
-[`src/pi-agent.ts`](src/pi-agent.ts) is the whole harness (simplified here): Dex's built-in agent loop with a
-[pi-ai](https://github.com/earendil-works/pi) model client, the prompt, and the tools.
+The same prompt, tools and ledger run on two agent harnesses;
+`SIGNUP_AGENT_HARNESS=pi|claude-agent-sdk` picks one, and the Slack post names it. Each file is the
+whole harness (simplified here):
+
+<table>
+<tr><th><a href="src/pi-agent.ts">pi</a></th><th><a href="src/claude-agent.ts">Claude Agent SDK</a></th></tr>
+<tr><td>
 
 ```ts
 createBuiltinAgentSessionFlow(
   {
     name: "signup-review",
     instructions: signupAgentPrompt,
-    model: createPiAiModelClient(getBuiltinModels("anthropic").find((m) => m.id === "claude-opus-5-5")),
-    tools: createSignupTools(services).map((tool) => functionTool({ ...tool, requiresApproval: false })),
+    model: createPiAiModelClient(
+      getBuiltinModels("anthropic")
+        .find((m) => m.id === "claude-opus-5-5")),
+    tools: createSignupTools(services).map((tool) =>
+      functionTool({ ...tool, requiresApproval: false })),
     toolSources: [createSignupConnectorTools(services)],
   },
   "SignupReviewPiAgentFlow",
 );
 ```
 
-Every model call is one `RunModel` Step and every tool call its own tool Step, so Dex Web shows the
-review call by call, and a crash repeats at most the one call that was running.
+</td><td>
+
+```ts
+createClaudeAgentSessionFlow(
+  {
+    options: {
+      model: "claude-opus-5-5",
+      systemPrompt: signupAgentPrompt,
+      tools: [], settingSources: [],
+      env: claudeCliEnvironment("login"),
+    },
+    customTools: createSignupTools(services).map((t) =>
+      tool(t.name, t.description, t.schema.shape, run(t))),
+    toolPolicies: /* each tool's effect, no approval */,
+    toolSources: [createSignupConnectorTools(services)],
+  },
+  "SignupReviewClaudeAgentFlow",
+);
+```
+
+</td></tr>
+<tr><td>Dex's built-in agent loop runs the session; pi-ai makes each model call. Every model call is a
+<code>RunModel</code> Step and every tool call its own tool Step, so Dex Web shows the review call by
+call, and a crash repeats at most the one call that was running.</td>
+<td>The Claude Code CLI runs each turn segment in one <code>RunModel</code> Step, with the read tools
+inside it. Each write leaves the segment and runs in its own tool Step, one at a time; then the
+Claude session resumes. Locally the CLI uses your Claude Code login (<code>SIGNUP_AGENT_CLAUDE_AUTH=login</code>),
+or <code>ANTHROPIC_API_KEY</code> with <code>api-key</code>.</td></tr>
+</table>
+
+Each harness has its own session Flow type, and the Worker runs one of them: finish the open reviews
+before switching, or switch back to let them finish.
 
 ## The glue
 
@@ -147,8 +185,9 @@ You need Node.js 22.19 or later (24 recommended, `.nvmrc`) and
 
    Dex Web saves them to `~/.dex/connectors/connections.json`; copy its path from **Local store**.
 3. **Configure:** `cp .env.example .env`, then fill in the ReviewAPI URL and key (Dex Cloud staging),
-   `SLACK_REVIEW_CHANNEL`, `SIGNUP_REVIEWER_SLACK_IDS`, `DEX_CONNECTOR_CONFIG_FILE`, and
-   `ANTHROPIC_API_KEY`.
+   `SLACK_REVIEW_CHANNEL`, `SIGNUP_REVIEWER_SLACK_IDS`, `DEX_CONNECTOR_CONFIG_FILE`, and the harness:
+   `SIGNUP_AGENT_HARNESS=pi` with `ANTHROPIC_API_KEY`, or `SIGNUP_AGENT_HARNESS=claude-agent-sdk`
+   after signing in to Claude Code once (`claude`, then `/login`).
 4. **Start the agent:** `npm install && npm start`. It reviews every pending sign-up. Stop it with
    Ctrl+C at any time: the sessions wait in Dex and go on when it starts again.
 5. **Review in Slack:** reply in the review's thread with `approve`, `reject <reason>`, or what to
@@ -163,7 +202,9 @@ You need Node.js 22.19 or later (24 recommended, `.nvmrc`) and
 | `SLACK_REVIEW_CHANNEL` | Channel ID of the review posts |
 | `SIGNUP_REVIEWER_SLACK_IDS` | Comma-separated Slack member IDs whose replies count |
 | `DEX_CONNECTOR_CONFIG_FILE` | The connector configuration with `review-slack` and `welcome-gmail` |
-| `SIGNUP_AGENT_PI_MODEL`, `ANTHROPIC_API_KEY` | The pi-ai model (`anthropic/claude-opus-5-5`) and its key |
+| `SIGNUP_AGENT_HARNESS` | `pi` (default) or `claude-agent-sdk` |
+| `SIGNUP_AGENT_PI_MODEL`, `ANTHROPIC_API_KEY` | pi: the pi-ai model (`anthropic/claude-opus-5-5`) and its key |
+| `SIGNUP_AGENT_CLAUDE_MODEL`, `SIGNUP_AGENT_CLAUDE_AUTH`, `SIGNUP_AGENT_CLAUDE_CLI` | Claude Agent SDK: the model (`claude-opus-5-5`), `login` (default) or `api-key`, and an optional Claude Code CLI path |
 | `GITHUB_TOKEN` | Optional, raises the GitHub API rate limit |
 | `SIGNUP_REVIEW_SINCE` | Required. RFC 3339 time, such as `2026-11-13T00:00:00Z`: only sign-ups registered since then are reviewed |
 | `SIGNUP_WATCH_INTERVAL_SECONDS`, `SIGNUP_THREAD_POLL_SECONDS` | Seconds between reads of the pending sign-ups (30) and of each thread (60; Slack may allow a non-Marketplace app one thread read a minute) |
@@ -171,9 +212,12 @@ You need Node.js 22.19 or later (24 recommended, `.nvmrc`) and
 
 ## Tests
 
-`npm test` runs the review end to end on a private local Dex engine (`dexcli dev --engine zd`, started
+`npm test` runs the review end to end, once per harness, on a private local Dex engine (`dexcli dev --engine zd`, started
 by the test; `dexcli` and `dex-server-zd` must be on `PATH`) with a scripted model, the Slack and Gmail
-connector mocks, and a test-only ReviewAPI stub. No model, Slack, Gmail or GitHub call is made.
+connector mocks, and a test-only ReviewAPI stub. pi gets a scripted model client; the Claude Agent SDK
+runs the real bundled Claude Code CLI against a scripted local Messages API, with a dummy key and no
+network, and the test checks that the CLI offers only the agent's own tools. No model, Slack, Gmail
+or GitHub call is made.
 
 Scenarios: a review with one revision, approval and the email; a request to approve that no reviewer
 wrote, and a send before `send`, both refused (a refused send is no attempt); a reviewer reply sent
@@ -223,6 +267,8 @@ of adversarial HTML.
 - The ReviewAPI lists pending sign-ups oldest first, and a round reads at most 10 pages of 100: with a
   backlog of more than 1,000 older pending sign-ups, newer ones are not reached. `SIGNUP_REVIEW_SINCE`
   only filters what a round read.
+- The Claude harness's `login` mode is for running the demo on your own machine. The Claude Agent SDK
+  documentation says products built on it authenticate with an API key; use `api-key` anywhere else.
 - `fetch_profile` refuses to run with `NODE_USE_ENV_PROXY` set, and connects through its own HTTPS agent,
   so no proxy resolves a host past the address check.
 
