@@ -321,6 +321,18 @@ export function registerSignupReviewScenarios(setup: SignupReviewScenarioSetup):
     // The model is told the outcome is unknown, not that the approval failed.
     assert.match((await resultsOf(sessionId, "approve_account")).at(-1) ?? "", /outcome (is )?unknown/);
     assert.equal((await client.describeFlow(sessionId)).status, "running");
+    // Once the ReviewAPI answers again, `[dex-cloud active]` shows the approval took effect: the review goes on to the email.
+    await pollUntil(async () => ((await userTexts(sessionId)).some((text) => text.startsWith("[dex-cloud active]")) ? true : undefined), {
+      description: "the poller reports the active account",
+      ...waitOptions,
+    });
+    await waitForIdle(sessionId);
+    assert.equal((await client.describeFlow(sessionId)).status, "running");
+    assert.ok(!threadReplies(sessionId).some((text) => /Decided in Dex Cloud admin/.test(text)));
+    gmail.sendMessage().forFlow(sessionId).respond(sent("gmail-after-unknown"));
+    await replyAndWait(sessionId, thread, "send");
+    assert.equal(sendsOf(sessionId).length, 1);
+    await waitForStop(accountId);
   });
 
   test(`${setup.harnessName}: a [slack <ts>] message that arrives twice is handled once`, async () => {
