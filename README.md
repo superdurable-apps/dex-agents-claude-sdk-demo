@@ -176,6 +176,10 @@ of adversarial HTML.
 - If an admin approves the account in Dex Cloud admin while the reviewers' latest decision is also
   `approve`, the review counts the account as approved and may still send its welcome email, next to
   the platform's own approval mail.
+- Forwarding a reply checks the session for its marker and then sends it. If a heartbeat timeout lets
+  an old and a new attempt of `ForwardReplies` overlap, one reply can reach the session twice.
+  Decisions are not affected, since the guards read `RelayedReplies`; at worst the agent posts one
+  extra draft.
 - Every review finishes within 7 days, or its thread-watch Flow stops it.
 - `fetch_profile` refuses to run with `NODE_USE_ENV_PROXY` set, and connects through its own HTTPS agent,
   so no proxy resolves a host past the address check.
