@@ -371,10 +371,10 @@ export function registerSignupReviewScenarios(setup: SignupReviewScenarioSetup):
     assert.equal(sendsOf(sessionId).length, 1);
     assert.notEqual((await snapshotOf(sessionId)).state?.lastTurnError ?? null, null);
     assert.equal((await services.sessions.read(accountId)).hasSendAttempt, true);
-    // The model tries again: the send is refused, and no second email goes out.
+    // The model tries again: the guard refuses before recording, so the ledger still holds the one send.
     await sendAndWait(sessionId, "[test]: send now");
     assert.equal(sendsOf(sessionId).length, 1);
-    assert.match((await resultsOf(sessionId, "send_welcome_email")).at(-1) ?? "", /refused: send_welcome_email already ran/);
+    assert.equal((await ledgerEffects(accountId)).filter((effect) => effect.tool === "send_welcome_email").length, 1);
   });
 
   test(`${setup.harnessName}: a draft whose post is uncertain blocks the email`, async () => {

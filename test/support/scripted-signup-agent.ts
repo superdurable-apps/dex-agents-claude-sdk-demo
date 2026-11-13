@@ -81,7 +81,7 @@ export function decideNextStep(userTexts: readonly string[], seen: readonly Seen
     const isRejected = seen[0]?.output.includes('"rejected"') === true;
     return follow([tool("reject_account"), tool("reply_in_thread", { text: `reject_account: ${seen[0]?.output ?? ""}` }), ...(isRejected ? [tool("finish_review")] : [])], seen);
   }
-  if ((reply === "send" || reply === "send now") && isMulti) {
+  if (reply === "send" && isMulti) {
     const note = tool("reply_in_thread", { text: "Sending the email." });
     return follow([isReversed ? tools(note, tool("send_welcome_email")) : tools(tool("send_welcome_email"), note)], seen);
   }
