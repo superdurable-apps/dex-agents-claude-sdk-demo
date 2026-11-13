@@ -5,13 +5,13 @@ import { z } from "zod";
 const AccountSchema = z.object({
   accountId: z.string().min(1),
   email: z.string().min(1),
-  // Absent until the sign-up form collects them.
-  displayName: z.string().optional(),
-  profileUrl: z.string().optional(),
-  signupMethod: z.string().optional(),
+  // Absent or null until the sign-up form collects them.
+  displayName: z.string().nullish(),
+  profileUrl: z.string().nullish(),
+  signupMethod: z.string().nullish(),
   status: z.enum(["pending_verification", "pending_approval", "active", "rejected", "expired", "disabled"]),
   registeredAt: z.string().min(1),
-  emailVerifiedAt: z.string().optional(),
+  emailVerifiedAt: z.string().nullish(),
   // Opaque: sent back unchanged as expectedRevision.
   revision: z.union([z.number(), z.string()]),
 });
@@ -28,6 +28,9 @@ export const ReviewApiErrorCode = [
   "internal",
 ] as const;
 export type ReviewApiErrorCode = (typeof ReviewApiErrorCode)[number];
+
+/** A decision may wait up to 10 seconds for its account's run and the server answers within 30 seconds. */
+const decisionTimeoutMs = 30_000;
 
 /** A failed ReviewAPI call; `revision_conflict` carries the current account. */
 export class ReviewApiError extends Error {
@@ -57,7 +60,17 @@ export class ReviewApiClient {
   /** Accounts waiting for approval, oldest registration first; `pageSize` is at most 100. */
   public async listPendingAccounts(pageSize: number, pageToken: string, signal?: AbortSignal) {
     const body = await this.post("list-pending", { pageSize, pageToken }, signal);
-    return { accounts: z.array(AccountSchema).parse(body.accounts ?? []), nextPageToken: String(body.nextPageToken ?? "") };
+    const accounts: Account[] = [];
+    // One malformed row is skipped and logged; it never hides the rest of the page.
+    for (const row of Array.isArray(body.accounts) ? (body.accounts as unknown[]) : []) {
+      const parsed = AccountSchema.safeParse(row);
+      if (parsed.success) {
+        accounts.push(parsed.data);
+      } else {
+        console.warn(`ReviewAPI list-pending: skipped a malformed account: ${parsed.error.issues.map((issue) => issue.path.join(".")).join(", ")}`);
+      }
+    }
+    return { accounts, nextPageToken: String(body.nextPageToken ?? "") };
   }
 
   public async getAccount(accountId: string, signal?: AbortSignal): Promise<Account> {
@@ -69,15 +82,15 @@ export class ReviewApiClient {
     request: { accountId: string; requestId: string; expectedRevision: number | string; suppressApprovedMail: boolean },
     signal?: AbortSignal,
   ): Promise<Account> {
-    return AccountSchema.parse((await this.post("approve", request, signal)).account);
+    return AccountSchema.parse((await this.post("approve", request, signal, decisionTimeoutMs)).account);
   }
 
   public async rejectAccount(request: { accountId: string; requestId: string; expectedRevision: number | string }, signal?: AbortSignal): Promise<Account> {
-    return AccountSchema.parse((await this.post("reject", request, signal)).account);
+    return AccountSchema.parse((await this.post("reject", request, signal, decisionTimeoutMs)).account);
   }
 
-  private async post(operation: string, payload: object, signal?: AbortSignal): Promise<Record<string, unknown>> {
-    const timeout = AbortSignal.timeout(10_000);
+  private async post(operation: string, payload: object, signal?: AbortSignal, timeoutMs = 10_000): Promise<Record<string, unknown>> {
+    const timeout = AbortSignal.timeout(timeoutMs);
     const response = await fetch(`${this.baseUrl}/v1/account-review/${operation}`, {
       method: "POST",
       headers: { "content-type": "application/json", authorization: `Bearer ${this.settings.apiKey}` },

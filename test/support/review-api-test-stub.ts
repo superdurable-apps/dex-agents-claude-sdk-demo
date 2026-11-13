@@ -17,16 +17,25 @@ export interface RecordedDecision {
 
 interface StoredAccount {
   account: Account;
-  readonly appliedRequests: Map<string, Account>;
+  /** The last decision applied: its fingerprint over every member, and the account it left. */
+  lastDecision?: { readonly fingerprint: string; readonly account: Account };
 }
 
-/** TEST ONLY. A ReviewAPI with accounts in memory: CAS on `expectedRevision` and idempotent `requestId`. */
+/**
+ * TEST ONLY. A ReviewAPI with accounts in memory, following docs/api/account-review-api.md: revisions start at 0;
+ * `revision_conflict` for a moved revision; `failed_precondition` for an account that is not pending; a repeat with
+ * the same members answers 200 only while it is still the account's last decision.
+ */
 export class ReviewApiTestStub {
   public readonly decisions: RecordedDecision[] = [];
   public readonly apiKey = "srk_test_not-a-real-secret";
   private readonly accounts = new Map<string, StoredAccount>();
   /** Operations whose next call is applied but answered with a 503, as a lost response would look. */
   private readonly failAfterApplying = new Set<string>();
+  /** As the server does until it can leave the platform's approval mail out: refuse `suppressApprovedMail: true`. */
+  public refusesSuppressedMail = false;
+  /** Gets answered with a 503 before the next one succeeds. */
+  public failingGets = 0;
 
   private constructor(private readonly server: Server) {}
 
@@ -51,8 +60,8 @@ export class ReviewApiTestStub {
 
   /** Adds a pending sign-up. */
   public addPendingAccount(account: Omit<Account, "status" | "revision" | "registeredAt"> & Partial<Account>): Account {
-    const stored: Account = { status: "pending_approval", revision: 1, registeredAt: new Date().toISOString(), ...account };
-    this.accounts.set(stored.accountId, { account: stored, appliedRequests: new Map() });
+    const stored: Account = { status: "pending_approval", revision: 0, registeredAt: new Date().toISOString(), emailVerifiedAt: null, ...account };
+    this.accounts.set(stored.accountId, { account: stored });
     return stored;
   }
 
@@ -60,6 +69,7 @@ export class ReviewApiTestStub {
   public decideElsewhere(accountId: string, status: Account["status"]): void {
     const stored = this.accounts.get(accountId)!;
     stored.account = { ...stored.account, status, revision: Number(stored.account.revision) + 1 };
+    delete stored.lastDecision;
   }
 
   /** Applies the next `operation` call, then answers 503 instead of the result. */
@@ -93,6 +103,11 @@ export class ReviewApiTestStub {
       return;
     }
     if (operation === "get") {
+      if (this.failingGets > 0) {
+        this.failingGets -= 1;
+        send(response, 503, { error: { code: "unavailable", message: "busy" } });
+        return;
+      }
       send(response, 200, { account: stored.account });
       return;
     }
@@ -108,21 +123,25 @@ export class ReviewApiTestStub {
       ...(operation === "approve" ? { suppressApprovedMail: input.suppressApprovedMail === true } : {}),
     };
     this.decisions.push(decision);
-    const applied = stored.appliedRequests.get(decision.requestId);
-    if (applied !== undefined) {
-      send(response, 200, { account: applied });
+    const fingerprint = JSON.stringify([operation, input.accountId, input.requestId, input.expectedRevision, input.suppressApprovedMail ?? false]);
+    if (stored.lastDecision?.fingerprint === fingerprint) {
+      send(response, 200, { account: stored.lastDecision.account });
       return;
     }
-    if (String(decision.expectedRevision) !== String(stored.account.revision) || stored.account.status !== "pending_approval") {
+    if (operation === "approve" && input.suppressApprovedMail === true && this.refusesSuppressedMail) {
+      send(response, 409, { error: { code: "failed_precondition", message: "suppressApprovedMail is not supported yet" } });
+      return;
+    }
+    if (String(decision.expectedRevision) !== String(stored.account.revision)) {
       send(response, 409, { error: { code: "revision_conflict", message: "the account changed" }, account: stored.account });
       return;
     }
-    stored.account = {
-      ...stored.account,
-      status: operation === "approve" ? "active" : "rejected",
-      revision: Number(stored.account.revision) + 1,
-    };
-    stored.appliedRequests.set(decision.requestId, stored.account);
+    if (stored.account.status !== "pending_approval") {
+      send(response, 409, { error: { code: "failed_precondition", message: `the account is ${stored.account.status}` } });
+      return;
+    }
+    stored.account = { ...stored.account, status: operation === "approve" ? "active" : "rejected", revision: Number(stored.account.revision) + 1 };
+    stored.lastDecision = { fingerprint, account: stored.account };
     if (this.failAfterApplying.delete(operation)) {
       send(response, 503, { error: { code: "unavailable", message: "lost answer" } });
       return;
