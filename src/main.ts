@@ -56,7 +56,7 @@ console.log(`Signup review agent (${sessionFlow.getFlowType()}) is running on ${
 
 const stopping = new AbortController();
 const watching = runSignupWatcher(
-  { client, sessionFlow, reviewApi: services.reviewApi, reviewSince: config.reviewSince },
+  { client, sessionFlow, sessions: services.sessions, reviewApi: services.reviewApi, reviewSince: config.reviewSince },
   config.watchIntervalMs,
   stopping.signal,
 );

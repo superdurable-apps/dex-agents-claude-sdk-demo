@@ -137,6 +137,57 @@ export class ReviewSessions {
   }
 }
 
+/** The first retry of a failed turn waits this long; each later one twice as long, up to {@link maxRetryDelayMs}. */
+export const firstRetryDelayMs = 2 * 60_000;
+export const maxRetryDelayMs = 30 * 60_000;
+/** Starts every retry message: `[retry turn-<n>]`, with the failed turn's ID. */
+export const retryMarkerPrefix = "[retry ";
+
+/** A failed turn of an idle session, and when and how to retry it. */
+export interface FailedTurn {
+  /** The failed turn, `turn-<n>`. */
+  readonly turnId: string;
+  /** Its error, short and on one line. */
+  readonly error: string;
+  /** Retries already sent since the message whose turn first failed: 0 for a fresh failure. */
+  readonly retries: number;
+  /** When the next retry is due, in epoch milliseconds. */
+  readonly dueAt: number;
+  /** The retry message's marker, unique per failed turn, and the text after it. */
+  readonly marker: string;
+  readonly text: string;
+}
+
+/**
+ * The latest turn of an idle session if it failed, or `undefined`. A turn that ends well clears `lastTurnError`, and
+ * a queued message starts a turn anyway, so neither counts. The back-off keeps no state of its own: the retries are
+ * the retry messages after the message whose turn first failed, and the wait counts from the newest stored message.
+ */
+export function failedTurnOf(snapshot: AgentSnapshot, firstDelayMs = firstRetryDelayMs): FailedTurn | undefined {
+  const state = snapshot.state;
+  if (state?.status !== "waiting_for_user_message" || !state.lastTurnError || snapshot.queuedMessageCount > 0 || state.turnCount < 1) {
+    return undefined;
+  }
+  const users = snapshot.messages.filter((message) => message.role === "user" && message.origin === undefined);
+  const isRetry = (message: AgentMessage) => (message.text ?? "").startsWith(retryMarkerPrefix);
+  const original = [...users].reverse().find((message) => !isRetry(message));
+  const retries = users.filter((message) => isRetry(message) && message.sequence > (original?.sequence ?? 0)).length;
+  const newest = snapshot.messages.at(-1);
+  const since = newest === undefined ? Date.now() : Date.parse(newest.createdAt);
+  const turnId = `turn-${state.turnCount}`;
+  const error = state.lastTurnError.replace(/\s+/g, " ").trim().slice(0, 200);
+  // The failed turn's message is quoted, since a harness may not have kept a turn that failed.
+  const quoted = (original?.text ?? "").slice(0, 4_000);
+  return {
+    turnId,
+    error,
+    retries,
+    dueAt: since + Math.min(firstDelayMs * 2 ** retries, maxRetryDelayMs),
+    marker: `${retryMarkerPrefix}${turnId}]`,
+    text: `The previous turn failed (${error}). Handle this message again as new, then continue the review from where you left off:\n${quoted}`,
+  };
+}
+
 /** Whether Slack timestamp `ts` is later than `other`, compared exactly (`<seconds>.<microseconds>`). */
 export function isLater(ts: string, other: string): boolean {
   const exact = (value: string): bigint => {

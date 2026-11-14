@@ -31,10 +31,17 @@ import {
 } from "@superdurable/dex";
 
 import { ReviewApiError, type ReviewApiClient } from "./review-api.js";
-import { isLater, reviewSessionId, type ReviewSessions, type ReviewerReply } from "./review-state.js";
+import { failedTurnOf, firstRetryDelayMs, isLater, reviewSessionId, type ReviewSessions, type ReviewerReply } from "./review-state.js";
 
+/**
+ * The poller's Step input. Besides the account, it carries what the poller already said in the thread, from Step to
+ * Step: the Slack users it told that only listed reviewers are read, and the failed turn it reported. That is
+ * transition input, not an Attribute, so nothing else reads or writes it.
+ */
 export interface PollerInput {
   readonly accountId: string;
+  readonly hintedUsers?: readonly string[];
+  readonly reportedFailure?: string;
 }
 
 /** The review's Slack thread: the review post's channel and timestamp, and the Slack app's user that posted it. */
@@ -77,7 +84,19 @@ export interface PollerSettings {
   readonly maxReviewAgeMs?: number;
   /** A round longer than this is abandoned and skipped; 40 seconds by default. */
   readonly roundTimeoutMs?: number;
+  /** The wait before the first retry of a failed turn; 2 minutes by default. */
+  readonly firstRetryDelayMs?: number;
 }
+
+/** The poller's state for the next Step, without the fields of one Step's own input. */
+const carry = (input: PollerInput): PollerInput => ({
+  accountId: input.accountId,
+  ...(input.hintedUsers === undefined ? {} : { hintedUsers: input.hintedUsers }),
+  ...(input.reportedFailure === undefined ? {} : { reportedFailure: input.reportedFailure }),
+});
+/** A Slack member ID that is safe to mention. */
+const isSlackUserId = (value: string) => /^[UW][A-Z0-9]{2,20}$/.test(value);
+const nonReviewerHint = (userId: string) => `<@${userId}>, only listed reviewers' replies are read; ask an admin to add you to SIGNUP_REVIEWER_SLACK_IDS.`;
 
 /** Failures that skip one round instead of failing the Step: back-pressure, Dex hiccups, network, a slow round. */
 function isTransient(error: unknown, context: AsyncContext): boolean {
@@ -118,7 +137,9 @@ type RoundResult =
   | { readonly kind: "note"; readonly note: string }
   | { readonly kind: "relay"; readonly fresh: ReviewerReply[]; readonly page: string | undefined }
   | { readonly kind: "page"; readonly page: string }
-  | { readonly kind: "report"; readonly status: string };
+  | { readonly kind: "report"; readonly status: string }
+  | { readonly kind: "post"; readonly text: string; readonly next: PollerInput }
+  | { readonly kind: "retry"; readonly marker: string; readonly text: string };
 
 // dex:group group-id:poll group-label:"Poll"
 // dex:explanation text:"Reads the review thread one page a round, picks the new replies of listed reviewers, and ends with the review."
@@ -127,6 +148,7 @@ class WatchThread implements Step<PollerInput> {
   private readonly accountCheckEveryRounds: number;
   private readonly maxReviewAgeMs: number;
   private readonly roundTimeoutMs: number;
+  private readonly firstRetryDelayMs: number;
 
   public constructor(private readonly settings: PollerSettings) {
     // Slack allows a non-Marketplace app about one conversations.replies call a minute.
@@ -134,6 +156,7 @@ class WatchThread implements Step<PollerInput> {
     this.accountCheckEveryRounds = settings.accountCheckEveryRounds ?? 1;
     this.maxReviewAgeMs = settings.maxReviewAgeMs ?? 7 * 24 * 60 * 60_000;
     this.roundTimeoutMs = settings.roundTimeoutMs ?? 40_000;
+    this.firstRetryDelayMs = settings.firstRetryDelayMs ?? firstRetryDelayMs;
   }
 
   public getStepType(): string {
@@ -177,16 +200,23 @@ class WatchThread implements Step<PollerInput> {
         case "complete":
           return gracefulComplete(result.reason);
         case "note":
-          return goTo(PostWatchNote, { ...input, note: result.note });
+          return goTo(PostWatchNote, { ...carry(input), note: result.note });
         case "relay":
           threadCursor.set(context, result.fresh.at(-1)!.ts);
           if (result.page !== undefined) {
             threadPage.set(context, result.page);
           }
-          return goTo(ForwardReplies, { accountId: input.accountId, fresh: result.fresh });
+          return goTo(ForwardReplies, { ...carry(input), fresh: result.fresh });
         case "page":
           threadPage.set(context, result.page);
-          return goTo(WatchThread, { accountId: input.accountId });
+          return goTo(WatchThread, carry(input));
+        case "post":
+          // Each post is its own Step, so each gets its own connector call identity and dispatch fence.
+          return goTo(PostThreadNote, { ...result.next, text: result.text });
+        case "retry":
+          // The marker names the failed turn, so a retry is sent once however often this runs.
+          await this.settings.sessions.sendOnce(input.accountId, result.marker, result.text);
+          break;
         case "report":
           // The marker is the status, so each status reaches the session once, whoever decided; a new Execute (after
           // relayed replies or a restart) scans the session once more.
@@ -236,8 +266,16 @@ class WatchThread implements Step<PollerInput> {
     if (thread !== undefined) {
       const { messages, nextCursor } = await this.readThreadPage(context, thread, threadPage.get(context));
       const after = threadCursor.get(context) ?? thread.ts;
-      const fresh = messages
-        .filter((message) => isLater(message.timestamp, after) && message.userId !== undefined && message.userId !== thread.botUserId)
+      const people = messages.filter((message) => isLater(message.timestamp, after) && message.userId !== undefined && message.userId !== thread.botUserId);
+      // A person who is not a listed reviewer is told once, before any relay moves the cursor past their message: the
+      // users already told travel in the Step input, and a hint on this page counts too. Their message is not relayed.
+      const hinted = new Set(input.hintedUsers ?? []);
+      const isHinted = (userId: string) => hinted.has(userId) || messages.some((message) => message.userId === thread.botUserId && message.text.startsWith(`<@${userId}>, only listed reviewers`));
+      const stranger = people.find((message) => !this.settings.reviewerSlackIds.has(message.userId!) && isSlackUserId(message.userId!) && !isHinted(message.userId!));
+      if (stranger !== undefined) {
+        return { kind: "post", text: nonReviewerHint(stranger.userId!), next: { ...carry(input), hintedUsers: [...hinted, stranger.userId!].slice(-200) } };
+      }
+      const fresh = people
         .filter((message) => this.settings.reviewerSlackIds.has(message.userId!))
         .map((message) => ({ ts: message.timestamp, userId: message.userId!, text: message.text.trim() }));
       // A page with a next page is full: the next round reads the next one. The last page is read again for new replies.
@@ -247,6 +285,15 @@ class WatchThread implements Step<PollerInput> {
       if (nextCursor !== undefined) {
         return { kind: "page", page: nextCursor };
       }
+    }
+    // A failed turn is told once in the thread, then retried with a back-off until a turn succeeds.
+    const failed = failedTurnOf(snapshot, this.firstRetryDelayMs);
+    if (failed !== undefined && failed.retries === 0 && input.reportedFailure !== failed.turnId && thread !== undefined) {
+      const text = `The agent's last turn failed: ${failed.error.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")}. It retries automatically; you can also reply here to retry now.`;
+      return { kind: "post", text, next: { ...carry(input), reportedFailure: failed.turnId } };
+    }
+    if (failed !== undefined && Date.now() >= failed.dueAt) {
+      return { kind: "retry", marker: failed.marker, text: failed.text };
     }
     if (round % this.accountCheckEveryRounds === 0) {
       // Any decided status is reported, the agent's own decision included: the agent tells them apart.
@@ -272,7 +319,7 @@ class WatchThread implements Step<PollerInput> {
 
 // dex:group group-id:poll group-label:"Poll"
 // dex:explanation text:"Sends each new reviewer reply to the agent session, unless the session already holds it."
-class ForwardReplies implements Step<{ accountId: string; fresh: ReviewerReply[] }> {
+class ForwardReplies implements Step<PollerInput & { fresh: ReviewerReply[] }> {
   public constructor(private readonly settings: PollerSettings) {}
 
   public getStepType(): string {
@@ -283,11 +330,46 @@ class ForwardReplies implements Step<{ accountId: string; fresh: ReviewerReply[]
     return { executeRetry: { maximumAttempts: 10, totalDurationMs: 60 * 60_000 }, executeFailure: ExecuteFailure.proceedTo(PostWatchNote) };
   }
 
-  public async execute(_context: AsyncContext, input: { accountId: string; fresh: ReviewerReply[] }): Promise<StepDecision> {
+  public async execute(_context: AsyncContext, input: PollerInput & { fresh: ReviewerReply[] }): Promise<StepDecision> {
     for (const reply of input.fresh) {
       await this.settings.sessions.sendOnce(input.accountId, `[slack ${reply.ts}]`, `<@${reply.userId}>: ${reply.text}`);
     }
-    return goTo(WatchThread, { accountId: input.accountId });
+    return goTo(WatchThread, carry(input));
+  }
+}
+
+// dex:group group-id:poll group-label:"Poll"
+// dex:explanation text:"Posts one note in the thread, best effort: a failed turn, or a hint to someone who is not a listed reviewer."
+class PostThreadNote implements Step<PollerInput & { text: string }> {
+  public constructor(private readonly settings: PollerSettings) {}
+
+  public getStepType(): string {
+    return "PostThreadNote";
+  }
+
+  public getStepOptions(): StepOptions {
+    return { executeDurability: "sync", executeRetry: { maximumAttempts: 3, totalDurationMs: 10 * 60_000 } };
+  }
+
+  public async execute(context: AsyncContext, input: PollerInput & { text: string }): Promise<StepDecision> {
+    try {
+      const thread = reviewThread.get(context);
+      if (thread !== undefined) {
+        const operation = this.settings.slack.operations.postThreadReply();
+        const call = createCall(context, this.settings.slack.reference, operation.definition().operation);
+        const result = await runMutation(operation, call, { channelId: thread.channel, threadTimestamp: thread.ts, text: input.text });
+        if (result.branch !== "sent") {
+          console.warn(`review poller ${context.flowId}: a thread note ended ${result.branch}: ${result.failure?.message ?? ""}`);
+        }
+      }
+    } catch (error: unknown) {
+      if (error instanceof RetryError && context.attempt < 3) {
+        throwDexRetry(error);
+      }
+      // Best effort: the note counts as said either way, so a lasting Slack failure never repeats it in a loop.
+      console.warn(`review poller ${context.flowId}: a thread note was not posted: ${describe(error)}`);
+    }
+    return goTo(WatchThread, carry(input));
   }
 }
 
@@ -328,11 +410,13 @@ class PostWatchNote implements Step<PollerInput & { note?: string }> {
 export class SignupReviewThreadPoller implements Flow<PollerInput> {
   private readonly watchThread: WatchThread;
   private readonly forwardReplies: ForwardReplies;
+  private readonly postThreadNote: PostThreadNote;
   private readonly postWatchNote: PostWatchNote;
 
   public constructor(settings: PollerSettings) {
     this.watchThread = new WatchThread(settings);
     this.forwardReplies = new ForwardReplies(settings);
+    this.postThreadNote = new PostThreadNote(settings);
     this.postWatchNote = new PostWatchNote(settings);
   }
 
@@ -341,7 +425,7 @@ export class SignupReviewThreadPoller implements Flow<PollerInput> {
   }
 
   public getSteps(): StepList<PollerInput> {
-    return StepList.startStep(this.watchThread).otherSteps(this.forwardReplies, this.postWatchNote);
+    return StepList.startStep(this.watchThread).otherSteps(this.forwardReplies, this.postThreadNote, this.postWatchNote);
   }
 
   public getPersistenceSchema(): PersistenceSchema {

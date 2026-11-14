@@ -20,6 +20,10 @@ export const rejectedApplicantWord = "spammy";
 export const passiveApplicantWord = "passive";
 /** Applicants whose email contains this word make the model post a draft and a note in one response. */
 export const multiCallApplicantWord = "multi";
+/** Applicants whose email contains this word make the first turn fail, and its first retry too. */
+export const firstTurnFailingWord = "firstfail";
+/** Applicants whose email contains this word make the turn of the reviewer's "Shorter" fail once. */
+export const laterTurnFailingWord = "laterfail";
 
 /** Runs each response of `plan` in turn, skipping the calls already made since the user message, then answers. */
 function follow(plan: readonly ScriptedStep[], seen: readonly SeenResult[]): ScriptedStep {
@@ -37,11 +41,23 @@ const tool = (name: string, args: Record<string, unknown> = {}): ScriptedStep =>
 const tools = (...steps: ScriptedStep[]): ScriptedStep => ({ kind: "tools", calls: steps.flatMap((step) => (step.kind === "tools" ? step.calls : [])) });
 
 /** Decides the next step from the session's user messages, oldest first, and the tool results since the last one. */
-export function decideNextStep(userTexts: readonly string[], seen: readonly SeenResult[]): ScriptedStep {
+export function decideNextStep(rawUserTexts: readonly string[], seen: readonly SeenResult[]): ScriptedStep {
+  // A retry message quotes the failed turn's message after its first line; the model handles that message as new.
+  const isRetry = (text: string) => text.startsWith("[retry ");
+  const userTexts = rawUserTexts.map((text) => (isRetry(text) ? text.slice(text.indexOf("\n") + 1) : text));
+  const retries = rawUserTexts.filter(isRetry).length;
+  const isRetryTurn = isRetry(rawUserTexts.at(-1) ?? "");
   const userText = userTexts.at(-1) ?? "";
   const first = userTexts.find((text) => text.startsWith("Review Dex Cloud account")) ?? "";
   const facts = JSON.parse(first.slice(first.indexOf("{"), first.lastIndexOf("}") + 1) || "{}") as { email?: string; profileUrl?: string };
   const email = facts.email ?? "";
+  // Injected model failures: every model call of a turn fails, so the turn fails, until enough retries arrived.
+  if (seen.length === 0 && email.includes(firstTurnFailingWord) && userText === first && retries < 2) {
+    return { kind: "fail" };
+  }
+  if (seen.length === 0 && email.includes(laterTurnFailingWord) && /^\[slack [\d.]+\] <@\w+>: shorter$/i.test(userText) && retries < 1) {
+    return { kind: "fail" };
+  }
   if (userText === first) {
     const login = /github\.com\/([A-Za-z0-9-]+)/.exec(facts.profileUrl ?? "")?.[1] ?? "ada-builds";
     const isRejected = email.includes(rejectedApplicantWord);
@@ -54,7 +70,7 @@ export function decideNextStep(userTexts: readonly string[], seen: readonly Seen
     return follow([tool("github_user", { login }), review], seen);
   }
   const slackTs = /^\[slack ([\d.]+)\]/.exec(userText)?.[1];
-  if (slackTs !== undefined && userTexts.slice(0, -1).some((text) => text.startsWith(`[slack ${slackTs}]`))) {
+  if (slackTs !== undefined && !isRetryTurn && userTexts.slice(0, -1).some((text) => text.startsWith(`[slack ${slackTs}]`))) {
     // As the prompt says: a repeated ts is ignored.
     return { kind: "answer", text: "Already handled." };
   }
