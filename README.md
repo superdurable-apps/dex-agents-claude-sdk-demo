@@ -291,8 +291,10 @@ injected lookup, for redirects to private addresses, and for linear-time parsing
   decision tools check the session's own tool records (stored tool results, the session's turn notes,
   which list a failed turn's calls, and the running turn's finished calls), read through the session's
   messages up to 50 pages of 200. Those records live in the session Flow, so time travel of the session
-  to before the send rewinds them and the email can be sent again on purpose. A send whose outcome is
-  unknown counts as sent. When the history read stops short of the first message (past the 50 pages, or
+  to before the send rewinds them and the email can be sent again on purpose. A stored tool result counts
+  as a success when it is a JSON object, as every tool's success is; as failed only when it starts with the
+  framework's failure text or a tool's own refusal or definite failure; any other text counts as a possible
+  send, and never as a draft's post or a decision. A send whose outcome is unknown counts as sent. When the history read stops short of the first message (past the 50 pages, or
   with older messages gone) and the post of the current draft is not in what was read, the draft counts as
   sent and the send is refused. A turn note's outcome texts are free text (a ReviewAPI error or a fetched
   page can hold a line that looks like another entry), so a note only ever adds evidence of a send: each

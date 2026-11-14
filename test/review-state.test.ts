@@ -6,7 +6,7 @@ import test from "node:test";
 
 import { buildTurnFailureNote, outcomeUnknownToolResult, type AgentMessage, type AgentSnapshot, type AgentToolCallRecord } from "@superdurable/dex-agents";
 
-import { earlierDecision, failedTurnOf, jsonValueEnd, noteEntries, succeededOutput, toolRecordsOf, wasDraftSent, type ToolRecord } from "../src/review-state.js";
+import { earlierDecision, failedTurnOf, jsonValueEnd, noteEntries, outcomeOfResult, succeededOutput, toolRecordsOf, wasDraftSent, type ToolRecord } from "../src/review-state.js";
 
 const at = "2026-11-13T10:00:00.000Z";
 const message = (sequence: number, role: AgentMessage["role"], text: string | null, extra: Partial<AgentMessage> = {}): AgentMessage =>
@@ -143,6 +143,32 @@ test("a normal review: the draft is sent once, and a new draft can be sent again
   assert.equal(wasDraftSent(complete(toolRecordsOf([draft1, send1, draft2], [])), 2), false);
   // A draft posted in the running turn counts too, from its call record.
   assert.equal(wasDraftSent(complete(toolRecordsOf([draft1, send1], [call("post_draft", "{}", "succeeded", '{"draft":{"number":2}}', 1)])), 2), false);
+});
+
+test("failure words inside a successful result's own text do not make it a failure", () => {
+  const tool = (sequence: number, name: string, output: string) => message(sequence, "tool", null, { toolName: name, toolOutput: output });
+  const words = "Deploy failed: retry. refused: no. nothing was sent yet. not sent: x";
+  // (a) A draft whose Slack text holds the words is still posted, so its send is allowed.
+  const draft2 = JSON.stringify({ message: { channelId: "C1", timestamp: "1.2", text: `*[draft 2]*\n${words}` }, draft: { number: 2 } });
+  assert.equal(outcomeOfResult("post_draft", draft2), "succeeded");
+  const sent1 = tool(2, "send_welcome_email", '{"messageId":"m-1","draft":{"number":1}}');
+  assert.equal(wasDraftSent(complete(toolRecordsOf([tool(1, "post_review", '{"draft":{"number":1}}'), sent1, tool(3, "post_draft", draft2)], [])), 2), false);
+  // (b) A send whose result holds the words, in any field, still counts as sent.
+  const sent2 = JSON.stringify({ sender: "<team@example.com>", recipients: [`<${words.replace(/\s/g, "")}@example.com>`], messageId: "m-2", threadId: "t-2", subject: words, draft: { number: 2 } });
+  assert.equal(outcomeOfResult("send_welcome_email", sent2), "succeeded");
+  assert.equal(wasDraftSent(complete(toolRecordsOf([tool(3, "post_draft", draft2), tool(4, "send_welcome_email", sent2)], [])), 2), true);
+});
+
+test("only exact starts mark a stored result failed, and other text is a possible send", () => {
+  assert.equal(outcomeOfResult("send_welcome_email", "The tool call failed: send_welcome_email failed and nothing was sent: Gmail rejected the message"), "failed");
+  assert.equal(outcomeOfResult("send_welcome_email", "send_welcome_email failed and nothing was sent: Gmail rejected the message"), "failed");
+  assert.equal(outcomeOfResult("send_welcome_email", "refused: the account is pending_approval, not approved"), "failed");
+  assert.equal(outcomeOfResult("send_welcome_email", "not sent: ReviewAPI get: busy"), "failed");
+  assert.equal(outcomeOfResult("send_welcome_email", outcomeUnknownToolResult), "unknown");
+  // Text that is neither a success object nor a known start: a possible send, but no draft post or decision.
+  assert.equal(outcomeOfResult("send_welcome_email", "google-gmail sendMessage returned defect: refused: x"), "unknown");
+  assert.equal(outcomeOfResult("post_draft", "something else, failed: maybe"), "failed");
+  assert.equal(outcomeOfResult("approve_account", "approved, I think"), "failed");
 });
 
 test("an incomplete history without the draft's post fails closed", () => {
