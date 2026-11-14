@@ -29,6 +29,8 @@ interface StoredAccount {
 export class ReviewApiTestStub {
   public readonly decisions: RecordedDecision[] = [];
   public readonly apiKey = "srk_test_not-a-real-secret";
+  /** The key the tests give the poller, so a test can show the poller alone a stale account. */
+  public readonly pollerApiKey = "srk_test_poller-not-a-real-secret";
   private readonly accounts = new Map<string, StoredAccount>();
   /** Operations whose next call is applied but answered with a 503, as a lost response would look. */
   private readonly failAfterApplying = new Set<string>();
@@ -40,8 +42,8 @@ export class ReviewApiTestStub {
   public failingGets = 0;
   /** Milliseconds every get waits before it answers. */
   public getDelayMs = 0;
-  /** Accounts whose gets answer `pending_approval` while they are active, so the poller reports no decision. */
-  public readonly stalePendingReads = new Set<string>();
+  /** Accounts whose gets with the poller's key answer `pending_approval`, as a lagging replica would: the poller reports no decision. */
+  public readonly pollerSeesPending = new Set<string>();
 
   private constructor(private readonly server: Server) {}
 
@@ -98,7 +100,8 @@ export class ReviewApiTestStub {
 
   private async answer(request: IncomingMessage, response: ServerResponse): Promise<void> {
     const body = await readBody(request);
-    if (request.headers.authorization !== `Bearer ${this.apiKey}`) {
+    const isPoller = request.headers.authorization === `Bearer ${this.pollerApiKey}`;
+    if (request.headers.authorization !== `Bearer ${this.apiKey}` && !isPoller) {
       send(response, 401, { error: { code: "unauthenticated", message: "unauthenticated" } });
       return;
     }
@@ -126,8 +129,8 @@ export class ReviewApiTestStub {
         send(response, 503, { error: { code: "unavailable", message: "busy" } });
         return;
       }
-      // A stale read, as a lagging replica would answer: the account still looks pending.
-      const stale = this.stalePendingReads.has(stored.account.accountId) && stored.account.status === "active";
+      // A stale read for the poller only: the account still looks pending.
+      const stale = isPoller && this.pollerSeesPending.has(stored.account.accountId);
       send(response, 200, { account: stale ? { ...stored.account, status: "pending_approval" } : stored.account });
       return;
     }
