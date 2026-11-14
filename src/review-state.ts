@@ -241,6 +241,11 @@ export interface ToolRecord {
   readonly output: string;
   /** Where the session stored it: a message sequence, or after every stored message for the running turn. */
   readonly position: number;
+  /**
+   * Where it comes from: a stored tool result, the running turn's call records, or a turn note. A note's outcome
+   * texts are free text that can look like more entries, so a note only ever adds evidence of a send.
+   */
+  readonly source: "result" | "active" | "note";
 }
 
 const bareToolName = (name: string | null | undefined) => (name ?? "").split("__").at(-1)!.split(".").at(-1)!;
@@ -324,7 +329,8 @@ export function noteEntries(text: string): NoteEntry[] {
   const footer = text.lastIndexOf("\n");
   return found.map((entry, index) => {
     const until = found[index + 1]?.start ?? footer;
-    return { tool: entry.tool, status: entry.status, output: until > entry.outputStart ? text.slice(entry.outputStart, until) : "" };
+    const end = Math.max(entry.outputStart, until);
+    return { tool: entry.tool, status: entry.status, output: text.slice(entry.outputStart, end), start: entry.start, outputStart: entry.outputStart, end };
   });
 }
 
@@ -333,6 +339,31 @@ export interface NoteEntry {
   /** The entry's status, or `undefined` when the entry does not read unambiguously. */
   readonly status: (typeof noteStatuses)[number] | undefined;
   readonly output: string;
+  /** Where its `\n- ` starts, where its outcome text starts, and where that ends, in the note. */
+  readonly start: number;
+  readonly outputStart: number;
+  readonly end: number;
+}
+
+const sendTool = "send_welcome_email";
+
+/**
+ * The evidence of a send in one turn note, as outcomes: each send entry that reads unambiguously, with its status;
+ * a send entry that does not, as unknown; and any other mention of the send tool, such as one inside another call's
+ * arguments or outcome text, as unknown too. Only a send's own header and outcome text explain a mention.
+ */
+export function noteSendEvidence(text: string): ToolRecord["outcome"][] {
+  const entries = noteEntries(text);
+  const sends = entries.filter((entry) => entry.tool === sendTool);
+  const evidence = sends.map((entry) => (entry.status === undefined ? "unknown" : outcomeOfStatus(entry.status)));
+  const isExplained = (at: number) => sends.some((entry) => (at > entry.start && at < entry.outputStart) || (entry.status !== undefined && at >= entry.outputStart && at < entry.end));
+  for (let at = text.indexOf(sendTool); at >= 0; at = text.indexOf(sendTool, at + 1)) {
+    if (!isExplained(at)) {
+      evidence.push("unknown");
+      break;
+    }
+  }
+  return evidence;
 }
 
 /**
@@ -345,14 +376,17 @@ export function toolRecordsOf(messages: readonly AgentMessage[], activeToolCalls
   for (const message of messages) {
     if (message.role === "tool" && message.toolName) {
       const output = message.toolOutput ?? message.text ?? "";
-      records.push({ tool: bareToolName(message.toolName), outcome: outcomeOfResult(output), output, position: message.sequence });
+      records.push({ tool: bareToolName(message.toolName), outcome: outcomeOfResult(output), output, position: message.sequence, source: "result" });
     } else if (message.role === "user" && message.origin !== undefined && noteOrigins.has(message.origin)) {
-      for (const entry of noteEntries(message.text ?? "")) {
-        if (entry.status !== undefined) {
-          records.push({ tool: entry.tool, outcome: outcomeOfStatus(entry.status), output: entry.output, position: message.sequence });
-        } else if (entry.tool === "send_welcome_email") {
-          // An entry that does not read unambiguously: a send may have happened; any other call is no known success.
-          records.push({ tool: entry.tool, outcome: "unknown", output: entry.output, position: message.sequence });
+      const text = message.text ?? "";
+      // From a note: evidence of a send, and a decision's success, which a decision tool checks against the account
+      // before it relies on it. Never a draft post: a note's free text could fake one after a real send.
+      for (const outcome of noteSendEvidence(text)) {
+        records.push({ tool: sendTool, outcome, output: "", position: message.sequence, source: "note" });
+      }
+      for (const entry of noteEntries(text)) {
+        if ((entry.tool === "approve_account" || entry.tool === "reject_account") && entry.status !== undefined) {
+          records.push({ tool: entry.tool, outcome: outcomeOfStatus(entry.status), output: entry.output, position: message.sequence, source: "note" });
         }
       }
     }
@@ -360,7 +394,7 @@ export function toolRecordsOf(messages: readonly AgentMessage[], activeToolCalls
   const after = (messages.at(-1)?.sequence ?? 0) + 1;
   for (const call of [...activeToolCalls].sort((left, right) => left.deferralOrder - right.deferralOrder)) {
     if (isFinalToolCallStatus(call.status)) {
-      records.push({ tool: bareToolName(call.toolName), outcome: outcomeOfStatus(call.status), output: call.output ?? call.error ?? "", position: after + call.deferralOrder / 1e6 });
+      records.push({ tool: bareToolName(call.toolName), outcome: outcomeOfStatus(call.status), output: call.output ?? call.error ?? "", position: after + call.deferralOrder / 1e6, source: "active" });
     }
   }
   return records;
@@ -379,8 +413,13 @@ export interface ToolHistory {
  */
 export function wasDraftSent(history: ToolHistory, draftNumber: number): boolean {
   const { records, isComplete } = history;
+  // A draft's post counts only from a structured record: a stored tool result or the running turn's call record.
   const posted = records.filter(
-    (record) => (record.tool === "post_review" || record.tool === "post_draft") && record.outcome === "succeeded" && record.output.includes(`"draft":{"number":${draftNumber}}`),
+    (record) =>
+      record.source !== "note" &&
+      (record.tool === "post_review" || record.tool === "post_draft") &&
+      record.outcome === "succeeded" &&
+      record.output.includes(`"draft":{"number":${draftNumber}}`),
   );
   if (posted.length === 0 && !isComplete) {
     return true;

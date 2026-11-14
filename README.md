@@ -294,10 +294,15 @@ injected lookup, for redirects to private addresses, and for linear-time parsing
   to before the send rewinds them and the email can be sent again on purpose. A send whose outcome is
   unknown counts as sent. When the history read stops short of the first message (past the 50 pages, or
   with older messages gone) and the post of the current draft is not in what was read, the draft counts as
-  sent and the send is refused. The turn notes are read entry by entry: the tool name, the arguments as one
-  whole JSON value, then the status, so text in a call's arguments never decides a status; an entry that
-  does not read that way counts as a possible send, and never as a decision that succeeded. Text in a
-  call's outcome can still look like another entry, which only ever adds a record.
+  sent and the send is refused. A turn note's outcome texts are free text (a ReviewAPI error or a fetched
+  page can hold a line that looks like another entry), so a note only ever adds evidence of a send: each
+  send entry that did not definitely fail, a send entry that does not read unambiguously, and any other
+  mention of `send_welcome_email` in the note count as a possible send. A note never counts as a draft's
+  post; that comes only from a stored tool result or the running turn's call record. Entries are read
+  structurally (the tool name, the arguments as one whole JSON value, then the status), so text in a
+  call's arguments never decides a status. The cost of failing closed: a note that names the send tool in
+  another call's text, or a send and a newer draft in the same failed turn, blocks the send of that draft,
+  which then goes out by hand.
 - The re-check before a retry is not atomic: a message that arrives between it and the send can still
   meet a retry message, which the agent then handles as well.
 - A failed turn is retried until a turn succeeds, every 30 minutes at most, with no limit on attempts:
