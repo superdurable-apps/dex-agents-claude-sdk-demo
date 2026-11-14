@@ -94,6 +94,14 @@ const carry = (input: PollerInput): PollerInput => ({
   ...(input.hintedUsers === undefined ? {} : { hintedUsers: input.hintedUsers }),
   ...(input.reportedFailure === undefined ? {} : { reportedFailure: input.reportedFailure }),
 });
+/**
+ * The bot ID of a thread message, when the connector gives one. The Slack connector 0.5 drops `bot_id` from thread
+ * messages (it keeps it only for channel messages), so this takes effect once it passes it on.
+ */
+const botIdOf = (message: object): string => {
+  const botId = (message as { botId?: unknown }).botId;
+  return typeof botId === "string" ? botId : "";
+};
 /** A Slack member ID that is safe to mention. */
 const isSlackUserId = (value: string) => /^[UW][A-Z0-9]{2,20}$/.test(value);
 const nonReviewerHint = (userId: string) => `<@${userId}>, only listed reviewers' replies are read; ask an admin to add you to SIGNUP_REVIEWER_SLACK_IDS.`;
@@ -139,7 +147,7 @@ type RoundResult =
   | { readonly kind: "page"; readonly page: string }
   | { readonly kind: "report"; readonly status: string }
   | { readonly kind: "post"; readonly text: string; readonly next: PollerInput }
-  | { readonly kind: "retry"; readonly marker: string; readonly text: string };
+  | { readonly kind: "retry"; readonly turnId: string };
 
 // dex:group group-id:poll group-label:"Poll"
 // dex:explanation text:"Reads the review thread one page a round, picks the new replies of listed reviewers, and ends with the review."
@@ -214,8 +222,9 @@ class WatchThread implements Step<PollerInput> {
           // Each post is its own Step, so each gets its own connector call identity and dispatch fence.
           return goTo(PostThreadNote, { ...result.next, text: result.text });
         case "retry":
-          // The marker names the failed turn, so a retry is sent once however often this runs.
-          await this.settings.sessions.sendOnce(input.accountId, result.marker, result.text);
+          // Read again right before it sends: the turn must still be the failed one and the retry due. The marker
+          // names the failed turn, so a retry is sent once however often this runs.
+          await this.settings.sessions.retryFailedTurn(input.accountId, result.turnId, this.firstRetryDelayMs);
           break;
         case "report":
           // The marker is the status, so each status reaches the session once, whoever decided; a new Execute (after
@@ -266,7 +275,8 @@ class WatchThread implements Step<PollerInput> {
     if (thread !== undefined) {
       const { messages, nextCursor } = await this.readThreadPage(context, thread, threadPage.get(context));
       const after = threadCursor.get(context) ?? thread.ts;
-      const people = messages.filter((message) => isLater(message.timestamp, after) && message.userId !== undefined && message.userId !== thread.botUserId);
+      // Only people count: never this app's posts, and never a message with a bot ID, any app's.
+      const people = messages.filter((message) => isLater(message.timestamp, after) && message.userId !== undefined && message.userId !== thread.botUserId && !botIdOf(message));
       // A person who is not a listed reviewer is told once, before any relay moves the cursor past their message: the
       // users already told travel in the Step input, and a hint on this page counts too. Their message is not relayed.
       const hinted = new Set(input.hintedUsers ?? []);
@@ -293,7 +303,7 @@ class WatchThread implements Step<PollerInput> {
       return { kind: "post", text, next: { ...carry(input), reportedFailure: failed.turnId } };
     }
     if (failed !== undefined && Date.now() >= failed.dueAt) {
-      return { kind: "retry", marker: failed.marker, text: failed.text };
+      return { kind: "retry", turnId: failed.turnId };
     }
     if (round % this.accountCheckEveryRounds === 0) {
       // Any decided status is reported, the agent's own decision included: the agent tells them apart.

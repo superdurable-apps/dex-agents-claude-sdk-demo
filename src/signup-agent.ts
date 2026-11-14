@@ -13,7 +13,7 @@ import { z } from "zod";
 
 import type { ProfileSources } from "./profile-sources.js";
 import { ReviewApiError, type Account, type ReviewApiClient } from "./review-api.js";
-import { accountIdOf, refusedPrefix, reviewSessionId, type ReviewSessions } from "./review-state.js";
+import { accountIdOf, refusedPrefix, reviewSessionId, succeededOutput, wasDraftSent, type ReviewSessions } from "./review-state.js";
 import type { ReviewThread } from "./review-thread-poller.js";
 
 export const signupAgentPrompt = `You review sign-ups for Dex Cloud, a hosted platform for building durable applications and AI agents, together with the admins in Slack.
@@ -72,6 +72,15 @@ export interface SignupTool {
 
 const refuse = (reason: string): never => {
   throw new ToolExecutionError(`${refusedPrefix}${reason}`);
+};
+/** A JSON object from a recorded tool result, or an empty object. */
+const parseObject = (text: string): Record<string, unknown> => {
+  try {
+    const value: unknown = JSON.parse(text);
+    return typeof value === "object" && value !== null && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
+  } catch {
+    return {};
+  }
 };
 const messageOf = (error: unknown) => (error instanceof Error ? error.message : String(error)).slice(0, 300);
 
@@ -325,7 +334,14 @@ export function createSignupConnectorTools(services: SignupServices): ToolSource
     write(threadReply, async (call, args) => {
       const accountId = accountOf(call);
       const reason = decision === "reject" ? rejectSchema.parse(args).reason : "";
-      const thread = await beforeDispatch(() => requireThread(accountId));
+      const { thread, earlier } = await beforeDispatch(async () => ({
+        thread: await requireThread(accountId),
+        earlier: succeededOutput(await sessions.toolRecords(accountId), `${decision}_account`),
+      }));
+      if (earlier !== undefined) {
+        // This decision already succeeded in this session, as after a retried turn: no second request or confirmation.
+        return newMutationBranch("sent", { ...parseObject(earlier), note: "already done earlier in this review; nothing was posted again" });
+      }
       const post = async (input: ThreadReplyInput) => threadReply.invoke(call, input);
       let account: Account;
       try {
@@ -359,6 +375,11 @@ export function createSignupConnectorTools(services: SignupServices): ToolSource
       const account = await services.reviewApi.getAccount(accountId, call.context.cancellationSignal);
       if (account.status !== "active") {
         refuse(`the account is ${account.status}, not approved`);
+      }
+      // The session's own records say whether this draft was sent already, for example by a turn that failed after
+      // the send and was retried. Time travel of the session rewinds them, so a deliberate re-send stays possible.
+      if (wasDraftSent(await sessions.toolRecords(accountId), draft.number)) {
+        refuse(`the welcome email for draft ${draft.number} was already sent in this review`);
       }
       return { thread, draft, account };
     });
