@@ -1,33 +1,38 @@
-// TEST ONLY: the review scenarios every harness passes, on a private local Dex engine with connector mocks.
+// TEST ONLY: the review scenarios every harness passes, on a private local Dex engine with connector mocks. Reviewer
+// replies arrive as Slack Events API envelopes on a Socket Mode stand-in, through the same reply runner and target as
+// the application (the Slack connector's MessageTriggerRunner, its durable inbox, and the Dex RPC target).
 
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 import test from "node:test";
 
 import { GmailMock, sendMessageBranch } from "@superdurable/connector-google-gmail/mock";
-import type { Message as SlackMessage } from "@superdurable/connector-slack";
-import { GeneratedMock, listThreadMessagesRead, postThreadReplySent, postThreadReplyUncertain, postChannelMessageSent } from "@superdurable/connector-slack/mock";
+import type { SlackSocketConnection } from "@superdurable/connector-slack";
+import { GeneratedMock, postChannelMessageSent, postThreadReplySent, postThreadReplyUncertain } from "@superdurable/connector-slack/mock";
+import { TriggerDeliveryAbortedError, newTriggerContext, type TriggerLogAttributes, type TriggerLogger } from "@superdurable/connectors-sdk";
+import { ConfigurationSchemaVersion, ConnectionStore, CredentialMaterial, InMemoryObjectStore, LoadedProject } from "@superdurable/connectors-sdk/projectconfig";
+import type { ProviderRequest, ProviderResponse } from "@superdurable/connectors-sdk/providerhttp";
 import { Client, Registry, TimeTravelType, Worker, openBlobCache, type BlobCache } from "@superdurable/dex";
-import { readAgentSnapshot, sendAgentUserMessage } from "@superdurable/dex-agents";
+import { readAgentSnapshot } from "@superdurable/dex-agents";
 import { PrivateDexEngine, pollUntil } from "@superdurable/dex-agents/testing";
 
 import { ReviewApiClient } from "../../src/review-api.js";
-import { ReviewSessions, reviewPollerId, reviewSessionId, type ReviewSessionFlow } from "../../src/review-state.js";
-import { SignupReviewThreadPoller, latestDraft, threadCursor, threadPage } from "../../src/review-thread-poller.js";
+import { createReviewReplyRunner, createReviewReplyTarget, reviewSlackConnection, type ReviewChannel } from "../../src/review-replies.js";
+import { ReviewSessions, reviewSessionId, type ReviewSessionFlow } from "../../src/review-state.js";
 import { type SignupServices } from "../../src/signup-agent.js";
 import { startPendingReviews } from "../../src/signup-watcher.js";
 import { ReviewApiTestStub } from "./review-api-test-stub.js";
-import { FixtureProfileSources, failAfterApproveWord, failAfterSendWord, firstTurnFailingWord, laterTurnFailingWord, stayAfterSendWord, multiCallApplicantWord, passiveApplicantWord, rejectedApplicantWord } from "./scripted-signup-agent.js";
+import { FixtureProfileSources, failAfterApproveWord, failAfterSendWord, stayAfterSendWord, multiCallApplicantWord, passiveApplicantWord, rejectedApplicantWord } from "./scripted-signup-agent.js";
 
 const reviewerId = "UREVIEWER1";
 const bystanderId = "UBYSTANDER";
 const botUserId = "UBOT0000001";
 const channelId = "CREVIEWS01";
+const channel: ReviewChannel = { channelId, reviewerIds: new Set([reviewerId]) };
 const waitOptions = { timeoutMs: 120_000, intervalMs: 200 };
-/** The first retry of a failed turn waits this long in the tests. */
-const retryDelayMs = 300;
 const failure = (operation: string, message: string) => ({ kind: "TRANSPORT" as const, provider: "slack", operation, message });
 
 /** How a harness test builds its session Flow from the shared services. */
@@ -37,76 +42,152 @@ export interface SignupReviewScenarioSetup {
   close?(): Promise<void>;
 }
 
-/** A Slack thread whose replies the test writes; the poller's reads return it as it stands. */
-class ScriptedThread {
-  private readonly messages: SlackMessage[] = [];
-  private version = 0;
+/** One Socket Mode WebSocket: the envelopes Slack would send, and the acknowledgements the runner writes. */
+class FakeSocket implements SlackSocketConnection {
+  private readonly inbound: unknown[] = [];
+  private wake: (() => void) | undefined;
+  public isClosed = false;
+
+  public constructor(private readonly acknowledged: string[]) {}
+
+  public push(message: unknown): void {
+    this.inbound.push(message);
+    this.wake?.();
+  }
+
+  public async readMessage(readTimeoutMs: number): Promise<unknown> {
+    const deadline = Date.now() + readTimeoutMs;
+    for (;;) {
+      if (this.inbound.length > 0) {
+        return this.inbound.shift();
+      }
+      if (this.isClosed || Date.now() >= deadline) {
+        throw new Error(this.isClosed ? "connection closed" : "read timeout");
+      }
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, Math.max(1, deadline - Date.now()));
+        this.wake = () => {
+          clearTimeout(timer);
+          resolve();
+        };
+      });
+      this.wake = undefined;
+    }
+  }
+
+  public async writeMessage(value: unknown): Promise<void> {
+    this.acknowledged.push((value as { envelope_id: string }).envelope_id);
+  }
+
+  public close(): void {
+    this.isClosed = true;
+    this.wake?.();
+  }
+}
+
+/** Slack's side of Socket Mode: envelopes go to the open connection, or wait for the next one, as Slack holds them. */
+class SlackEvents {
+  public readonly acknowledged: string[] = [];
+  private socket: FakeSocket | undefined;
+  private readonly pending: unknown[] = [];
+  private envelopes = 0;
+  private events = 0;
+
+  public readonly dial = async (): Promise<SlackSocketConnection> => {
+    const socket = new FakeSocket(this.acknowledged);
+    for (const envelope of this.pending.splice(0)) {
+      socket.push(envelope);
+    }
+    this.socket = socket;
+    return socket;
+  };
+
+  /** Sends one message event in the review channel, unless `message` names another; returns its event ID. */
+  public push(message: Record<string, unknown>, eventId = `Ev${++this.events}`): string {
+    const envelope = {
+      envelope_id: `envelope-${++this.envelopes}`,
+      type: "events_api",
+      payload: { event_id: eventId, event_time: 1760227200, team_id: "T1", event: { type: "message", channel: channelId, ...message } },
+    };
+    if (this.socket !== undefined && !this.socket.isClosed) {
+      this.socket.push(envelope);
+    } else {
+      this.pending.push(envelope);
+    }
+    return eventId;
+  }
+}
+
+/** A review thread: the tool mocks post its root and replies, and people reply in it through {@link SlackEvents}. */
+class ReviewThread {
   private seconds: number;
 
   public constructor(
-    private readonly slack: GeneratedMock,
-    private readonly sessionId: string,
-    private readonly pollerId: string,
+    slack: GeneratedMock,
+    private readonly events: SlackEvents,
+    sessionId: string,
     public readonly rootTs: string,
   ) {
     this.seconds = Math.floor(Number(rootTs));
     slack.postChannelMessage().forFlow(sessionId).default(postChannelMessageSent({ message: { channelId, timestamp: rootTs, userId: botUserId, text: "review" } }));
     slack.postThreadReply().forFlow(sessionId).default(postThreadReplySent({ message: { channelId, timestamp: `${this.seconds}.000900`, threadTimestamp: rootTs, userId: botUserId, text: "ok" } }));
-    // The poller's own notes land in the thread, as the app's messages, so its later reads see them.
-    slack
-      .postThreadReply()
-      .forFlow(pollerId)
-      .when(
-        (input) => {
-          this.reply(botUserId, input.text);
-          return true;
-        },
-        postThreadReplySent({ message: { channelId, timestamp: `${this.seconds}.000800`, threadTimestamp: rootTs, userId: botUserId, text: "note" } }),
-      );
-    this.publish();
   }
 
-  /** The notes the poller posted in this thread. */
-  public pollerNotes(): string[] {
-    return this.slack.postThreadReply().calls().filter((call) => call.flowId === this.pollerId).map((call) => call.input.text);
-  }
-
-  /** Adds a message from `userId`; thread reads return it from now on. */
-  public reply(userId: string, text: string, botId?: string): string {
+  /** A reply in this thread; `extra` adds or overrides event fields, such as `bot_id`. */
+  public reply(userId: string, text: string, extra: Record<string, unknown> = {}): { ts: string; eventId: string; message: Record<string, unknown> } {
     this.seconds += 1;
     const ts = `${this.seconds}.000200`;
-    // A bot ID is what Slack sets on any app's message; the Slack connector 0.5 does not pass it on for threads yet.
-    this.messages.push({ channelId, timestamp: ts, threadTimestamp: this.rootTs, userId, text, ...(botId === undefined ? {} : { botId }) } as SlackMessage);
-    this.publish();
-    return ts;
-  }
-
-  /** Answers the session's next thread reply as an uncertain post. */
-  public failNextBotReply(): void {
-    this.slack
-      .postThreadReply()
-      .forFlow(this.sessionId)
-      .respond(postThreadReplyUncertain({ message: { channelId, timestamp: "", threadTimestamp: this.rootTs, userId: botUserId, text: "" } }, failure("postThreadReply", "lost")));
-  }
-
-  /** Publishes the thread as Slack pages it: 15 messages a page, the root first; page n > 1 has cursor `page-<n>`. */
-  private publish(): void {
-    this.version += 1;
-    const version = this.version;
-    const all: SlackMessage[] = [{ channelId, timestamp: this.rootTs, userId: botUserId, text: "review" }, ...this.messages];
-    for (let page = 1; (page - 1) * 15 < all.length; page++) {
-      const cursor = page === 1 ? "" : `page-${page}`;
-      const hasNext = page * 15 < all.length;
-      this.slack
-        .listThreadMessages()
-        .forFlow(this.pollerId)
-        .when(
-          (input) => this.version === version && (input.cursor ?? "") === cursor,
-          listThreadMessagesRead({ messages: all.slice((page - 1) * 15, page * 15), ...(hasNext ? { nextCursor: `page-${page + 1}` } : {}) }),
-        );
-    }
+    const message = { user: userId, text, ts, thread_ts: this.rootTs, ...extra };
+    return { ts, eventId: this.events.push(message), message };
   }
 }
+
+/** Keeps every Trigger record, so a test can find a skipped event. */
+class RecordingLogger implements TriggerLogger {
+  public readonly records: { level: string; message: string; attributes: TriggerLogAttributes }[] = [];
+
+  public isEnabled(): boolean {
+    return true;
+  }
+
+  public log(level: string, message: string, attributes: TriggerLogAttributes): void {
+    this.records.push({ level, message, attributes });
+  }
+
+  public find(message: string, attribute: string, value: string) {
+    return this.records.filter((record) => record.message === message && record.attributes[attribute] === value);
+  }
+}
+
+/** The review-slack connection of a local project, with an app token, and Slack's Web API answering Socket Mode. */
+async function socketModeProject(): Promise<LoadedProject> {
+  const objects = new InMemoryObjectStore();
+  const scope = { projectId: "signup-review-test", kind: "preview" } as const;
+  await new ConnectionStore(objects, scope).replaceCredential(
+    { connectorId: "slack", connectionName: reviewSlackConnection },
+    0,
+    new CredentialMaterial({ bot_token: "xoxb-test", user_token: "xoxp-test", app_token: "xapp-test" }, undefined, "oauth2"),
+  );
+  return new LoadedProject(
+    {
+      schemaVersion: ConfigurationSchemaVersion,
+      scope,
+      revision: 1,
+      connections: [{ connectorId: "slack", connectionName: reviewSlackConnection, modulePath: "slack", provider: "slack", configuration: { endpoint: "http://127.0.0.1:9/api" } }],
+      triggerBindings: [],
+      operationConfigurations: [],
+    },
+    undefined,
+    objects,
+    undefined,
+    undefined,
+  );
+}
+
+const slackWebApi = async (request: ProviderRequest): Promise<ProviderResponse> => {
+  const answer = new URL(request.url).pathname.endsWith("/apps.connections.open") ? { ok: true, url: "wss://wss-primary.slack.com/link/?ticket=test" } : { ok: false, error: "unknown_method" };
+  return { status: 200, headers: { "content-type": "application/json" }, body: Buffer.from(JSON.stringify(answer)) };
+};
 
 /** Registers the scenarios every harness passes. */
 export function registerSignupReviewScenarios(setup: SignupReviewScenarioSetup): void {
@@ -121,11 +202,15 @@ export function registerSignupReviewScenarios(setup: SignupReviewScenarioSetup):
   let blobCache: BlobCache;
   let cacheDirectory: string;
   let sessionFlow: ReviewSessionFlow;
-  let pollerFlow: SignupReviewThreadPoller;
+  let project: LoadedProject;
+  const events = new SlackEvents();
+  const logger = new RecordingLogger();
+  let runner: { stop: AbortController; running: Promise<void> } | undefined;
+  let runnerError: unknown;
   let accounts = 0;
   // Sign-ups registered before the tests started are the backlog the watcher must leave alone.
   const reviewSince = new Date(Date.now() - 1_000);
-  const watcherParts = () => ({ client, sessionFlow, sessions: services.sessions, reviewApi: services.reviewApi, reviewSince, firstRetryDelayMs: retryDelayMs });
+  const watcherParts = () => ({ client, sessionFlow, reviewApi: services.reviewApi, reviewSince });
 
   test.before(async () => {
     engine = await PrivateDexEngine.start();
@@ -133,7 +218,7 @@ export function registerSignupReviewScenarios(setup: SignupReviewScenarioSetup):
     slack = new GeneratedMock("review-slack");
     gmail = new GmailMock("welcome-gmail");
     services = {
-      sessions: new ReviewSessions(new Set([reviewerId])),
+      sessions: new ReviewSessions(),
       reviewApi: new ReviewApiClient({ baseUrl: reviewApi.baseUrl, apiKey: reviewApi.apiKey }),
       profiles: new FixtureProfileSources(),
       slack: slack.connection(),
@@ -142,35 +227,50 @@ export function registerSignupReviewScenarios(setup: SignupReviewScenarioSetup):
       harnessLabel: setup.harnessName,
     };
     sessionFlow = await setup.createFlow(services);
-    // The poller lists the bot as a reviewer on purpose: its own posts must still never be relayed.
-    pollerFlow = new SignupReviewThreadPoller({
-      ...services,
-      // Its own key, so a test can show the poller alone a stale account.
-      reviewApi: new ReviewApiClient({ baseUrl: reviewApi.baseUrl, apiKey: reviewApi.pollerApiKey }),
-      reviewerSlackIds: new Set([reviewerId, botUserId]),
-      client: () => client,
-      pollIntervalMs: 200,
-      accountCheckEveryRounds: 3,
-      roundTimeoutMs: 1_500,
-      firstRetryDelayMs: retryDelayMs,
-    });
-    registry = new Registry([sessionFlow, pollerFlow]);
+    registry = new Registry([sessionFlow]);
     cacheDirectory = mkdtempSync(join(tmpdir(), "signup-agent-test-"));
     blobCache = openBlobCache({ directory: cacheDirectory, maxBytes: 64 * 1024 * 1024 });
     client = new Client(registry, blobCache, { serverAddress: engine.serverAddress });
-    services.sessions.connect(client, sessionFlow, pollerFlow);
+    services.sessions.connect(client, sessionFlow);
     worker = await startWorker();
+    project = await socketModeProject();
+    runner = startRunner(services.sessions);
   });
 
   async function startWorker(): Promise<Worker> {
-    // Each open review's poller holds a slot while it polls, and most tests leave their review open.
-    const started = new Worker(registry, blobCache, { serverAddress: engine.serverAddress, pull: { stopDrainTimeoutMs: 1_000, maxConcurrentTasks: 64 } });
+    const started = new Worker(registry, blobCache, { serverAddress: engine.serverAddress, pull: { stopDrainTimeoutMs: 1_000, maxConcurrentTasks: 16 } });
     await started.start();
     await started.waitPullRegistered({ timeoutMs: 30_000 });
     return started;
   }
 
+  /** Runs the application's reply runner over the Socket Mode stand-in, with `sessions` as its thread index. */
+  function startRunner(sessions: ReviewSessions) {
+    const stop = new AbortController();
+    const target = createReviewReplyTarget({ client, sessionFlow, sessions, channel, logger });
+    const running = createReviewReplyRunner(project, channel, target, {
+      send: slackWebApi,
+      socketDialer: events.dial,
+      triggerTimings: { reconnectDelayMs: 5, reconnectMaxDelayMs: 20, readTimeoutMs: 10 * 60_000 },
+      logger,
+    })
+      .run(newTriggerContext(stop.signal))
+      .catch((error: unknown) => {
+        if (!(error instanceof TriggerDeliveryAbortedError)) {
+          runnerError = error;
+        }
+      });
+    return { stop, running };
+  }
+
+  async function stopRunner(): Promise<void> {
+    runner?.stop.abort();
+    await runner?.running;
+    runner = undefined;
+  }
+
   test.after(async () => {
+    await stopRunner();
     await worker?.close();
     await client?.close();
     blobCache?.close();
@@ -179,6 +279,7 @@ export function registerSignupReviewScenarios(setup: SignupReviewScenarioSetup):
     await setup.close?.();
     rmSync(cacheDirectory, { recursive: true, force: true });
     slack.assertNoFailures();
+    assert.equal(runnerError, undefined);
   });
 
   const snapshotOf = (sessionId: string) => readAgentSnapshot(client, sessionFlow, sessionId);
@@ -189,6 +290,7 @@ export function registerSignupReviewScenarios(setup: SignupReviewScenarioSetup):
   const sendsOf = (sessionId: string) => gmail.sendMessage().calls().filter((call) => call.flowId === sessionId);
   const sent = (messageId: string) => sendMessageBranch("sent", { sender: "<hello@example.com>", recipients: ["<ada@example.com>"], messageId, threadId: "t-1" });
   const applicant = (accountId: string) => `Ada &lt;Lovelace&gt; admin 'tick' (${reviewApi.accountOf(accountId)!.email})`;
+  const drafts = (sessionId: string) => threadReplies(sessionId).filter((text) => text.startsWith("*[draft ")).length;
 
   /** Waits until the session finished more than `afterTurns` turns and waits for the next message, or has ended. */
   async function waitForIdle(sessionId: string, afterTurns = 0): Promise<void> {
@@ -205,54 +307,36 @@ export function registerSignupReviewScenarios(setup: SignupReviewScenarioSetup):
     );
   }
 
+  /** Waits until the session ended, as finish_review ends it. */
+  async function waitForEnd(sessionId: string): Promise<void> {
+    await pollUntil(async () => ((await client.describeFlow(sessionId)).status === "running" ? undefined : true), { description: `${sessionId} ended`, ...waitOptions });
+  }
+
+  /** Waits until the session holds the reply `[slack <ts>]`. */
+  async function waitForReply(sessionId: string, ts: string): Promise<void> {
+    await pollUntil(async () => ((await userTexts(sessionId)).some((text) => text.startsWith(`[slack ${ts}]`)) ? true : undefined), { description: `the reply ${ts}`, ...waitOptions });
+  }
+
   /** Adds a pending sign-up, starts its review through the watcher, and waits for the review post. */
   async function startReview(emailWord: string, rootSeconds: number) {
     accounts += 1;
     const accountId = `acct${accounts}${Date.now().toString(36)}`;
     const sessionId = reviewSessionId(accountId);
-    const thread = new ScriptedThread(slack, sessionId, reviewPollerId(accountId), `${rootSeconds}.000100`);
+    const thread = new ReviewThread(slack, events, sessionId, `${rootSeconds}.000100`);
     reviewApi.addPendingAccount({ accountId, email: `${emailWord}-${accounts}@example.com`, displayName: "Ada <Lovelace>\nadmin `tick`", profileUrl: "https://github.com/ada-builds" });
     assert.deepEqual(await startPendingReviews(watcherParts()), []);
-    // A first turn that fails is retried by the watcher's later rounds, which a test of that runs here.
-    const post = await pollUntil(
-      async () => {
-        const found = slack.postChannelMessage().calls().find((call) => call.flowId === sessionId)?.input;
-        if (found === undefined && emailWord.includes(firstTurnFailingWord)) {
-          assert.deepEqual(await startPendingReviews(watcherParts()), []);
-        }
-        return found;
-      },
-      { description: "the review post", ...waitOptions },
-    );
+    const post = await pollUntil(async () => slack.postChannelMessage().calls().find((call) => call.flowId === sessionId)?.input, { description: "the review post", ...waitOptions });
     await waitForIdle(sessionId);
     return { accountId, sessionId, thread, post };
   }
 
-  /** Writes a reviewer reply and waits until the poller relayed it and the session handled it. */
-  async function replyAndWait(sessionId: string, thread: ScriptedThread, text: string, userId = reviewerId): Promise<string> {
+  /** A reviewer reply through Slack, and waits until the session got it and handled it. */
+  async function replyAndWait(sessionId: string, thread: ReviewThread, text: string): Promise<string> {
     const turns = await turnsOf(sessionId);
-    const ts = thread.reply(userId, text);
-    await pollUntil(async () => ((await userTexts(sessionId)).some((message) => message.startsWith(`[slack ${ts}]`)) ? true : undefined), {
-      description: `the relay of ${ts}`,
-      ...waitOptions,
-    });
+    const { ts } = thread.reply(reviewerId, text);
+    await waitForReply(sessionId, ts);
     await waitForIdle(sessionId, turns);
     return ts;
-  }
-
-  /** Sends a message to the session directly, as a test operator would, and waits for the turn it starts. */
-  async function sendAndWait(sessionId: string, text: string): Promise<void> {
-    const turns = await turnsOf(sessionId);
-    await sendAgentUserMessage(client, sessionFlow, sessionId, { text });
-    await waitForIdle(sessionId, turns);
-  }
-
-  /** Waits until the poller stopped the session and completed. */
-  async function waitForStop(accountId: string): Promise<void> {
-    for (const flowId of [reviewSessionId(accountId), reviewPollerId(accountId)]) {
-      await pollUntil(async () => ((await client.describeFlow(flowId)).status === "running" ? undefined : true), { description: `${flowId} stopped`, ...waitOptions });
-    }
-    assert.equal((await client.describeFlow(reviewPollerId(accountId))).status, "completed");
   }
 
   /** The results the model saw for tool `name`, oldest first. */
@@ -263,7 +347,7 @@ export function registerSignupReviewScenarios(setup: SignupReviewScenarioSetup):
     return stored.length > 0 ? stored : snapshot.toolCalls.filter((record) => bare(record.toolName) === name).map((record) => record.error ?? record.output ?? "");
   };
 
-  test(`${setup.harnessName}: a reviewer revises, approves and sends; the tools confirm each step and the review ends`, async () => {
+  test(`${setup.harnessName}: a reviewer revises, approves and sends through Slack replies; the tools confirm each step and the review ends`, async () => {
     const { accountId, sessionId, thread, post } = await startReview("ada", 1710000100);
     assert.equal(post.channelId, channelId);
     assert.match(post.text, /:white_check_mark: Approve/);
@@ -277,9 +361,14 @@ export function registerSignupReviewScenarios(setup: SignupReviewScenarioSetup):
     assert.deepEqual(await startPendingReviews(watcherParts()), []);
     assert.equal((await client.describeFlow(sessionId)).runId, runId);
 
-    // A bystander's message is not relayed; the bot's own message never is; the reviewer's feedback gives draft 2.
+    // Never delivered: a bystander's reply, this app's own post and another app's (both carry a bot ID), a bot message
+    // subtype, an edit, and a reviewer's message in another channel. The reviewer's feedback after them gives draft 2.
     thread.reply(bystanderId, "approve");
-    thread.reply(botUserId, "approve");
+    thread.reply(botUserId, "approve", { bot_id: "BAPP000001" });
+    thread.reply("UOTHERBOT01", "approve", { bot_id: "B0OTHERBOT1" });
+    thread.reply(reviewerId, "approve", { subtype: "bot_message" });
+    thread.reply(reviewerId, "approve", { subtype: "message_changed" });
+    thread.reply(reviewerId, "approve", { channel: "COTHER0001" });
     const feedbackTs = await replyAndWait(sessionId, thread, "Mention durable-queue");
     assert.equal(decisionsOf(accountId).length, 0);
     assert.match(threadReplies(sessionId).at(-1)!, /\*\[draft 2\]\*\n```\nSubject: Welcome to Dex Cloud\n\nHi Ada,\n\nWelcome to Dex Cloud. Revised: mention durable-queue/);
@@ -293,26 +382,54 @@ export function registerSignupReviewScenarios(setup: SignupReviewScenarioSetup):
     // A draft after the approval says the next step is `send`.
     await replyAndWait(sessionId, thread, "Shorter");
     assert.match(threadReplies(sessionId).at(-1)!, /^\*\[draft 3\]\*\n[\s\S]*Reply `send` to send this draft, or write what to change\.$/);
-    assert.equal((await client.getAttributes(reviewPollerId(accountId), latestDraft))[0]?.number, 3);
+    assert.equal((await services.sessions.review(accountId)).latestDraft?.number, 3);
 
     gmail.sendMessage().forFlow(sessionId).respond(sent("gmail-1"));
-    const sendTs = await replyAndWait(sessionId, thread, "send");
+    await replyAndWait(sessionId, thread, "send");
     assert.equal(sendsOf(sessionId).length, 1);
     assert.deepEqual(sendsOf(sessionId)[0]!.input.to, [reviewApi.accountOf(accountId)!.email]);
     assert.match(sendsOf(sessionId)[0]!.input.textBody, /Revised: shorter/);
     assert.ok(threadReplies(sessionId).includes(`Sent the welcome email to ${reviewApi.accountOf(accountId)!.email}.`));
-    assert.equal((await client.getAttributes(reviewPollerId(accountId), threadCursor))[0], sendTs);
-    await waitForStop(accountId);
+    await waitForEnd(sessionId);
 
-    // Each listed reviewer's reply reached the session once and nobody else's did; the agent's own approval may have
-    // been reported once as `[dex-cloud active]`, which changed nothing.
+    // Each reviewer reply reached the session once, and nothing else did.
     const relayed = await userTexts(sessionId);
     assert.equal(relayed.filter((text) => text.startsWith(`[slack ${feedbackTs}]`)).length, 1);
     assert.equal(relayed.filter((text) => text.startsWith("[slack ")).length, 4);
-    assert.equal(relayed.filter((text) => text.includes(bystanderId) || text.includes(botUserId)).length, 0);
-    assert.ok(relayed.filter((text) => text.startsWith("[dex-cloud")).every((text) => text.startsWith("[dex-cloud active]")));
-    assert.ok(relayed.filter((text) => text.startsWith("[dex-cloud active]")).length <= 1);
-    assert.ok(!threadReplies(sessionId).some((text) => /Decided in Dex Cloud admin/.test(text)));
+    assert.equal(relayed.filter((text) => text.includes(bystanderId) || text.includes(botUserId) || text.includes("UOTHERBOT01")).length, 0);
+
+    // A reply in the thread of the finished review cannot reach its closed session: it is consumed as undeliverable.
+    const { eventId } = thread.reply(reviewerId, "one more thing");
+    await pollUntil(() => (logger.find("trigger event skipped: undeliverable", "event_id", eventId).length === 1 ? true : undefined), { description: "the late reply consumed", ...waitOptions });
+  });
+
+  test(`${setup.harnessName}: the same Slack event delivered twice is handled once`, async () => {
+    const { sessionId, thread } = await startReview("twice", 1710000230);
+    const turns = await turnsOf(sessionId);
+    const { ts, eventId, message } = thread.reply(reviewerId, "Shorter");
+    await waitForReply(sessionId, ts);
+    await waitForIdle(sessionId, turns);
+    assert.equal(drafts(sessionId), 1);
+    // Slack sends the event again, as after a lost acknowledgement. Dex does not deduplicate the RPC, so the session
+    // may get the message twice; the agent ignores a ts it already saw.
+    const before = events.acknowledged.length;
+    events.push(message, eventId);
+    await pollUntil(() => (events.acknowledged.length > before ? true : undefined), { description: "the repeat acknowledged", ...waitOptions });
+    await sleep(1_000);
+    await waitForIdle(sessionId);
+    assert.equal(drafts(sessionId), 1);
+    assert.ok((await userTexts(sessionId)).filter((text) => text.startsWith(`[slack ${ts}]`)).length <= 2);
+  });
+
+  test(`${setup.harnessName}: a reviewer's reply in a thread that is no review's is dropped`, async () => {
+    const { accountId, sessionId, thread } = await startReview("unrelated", 1710000240);
+    const strayThread = "1600000000.000100";
+    const strayEvent = events.push({ user: reviewerId, text: "approve", ts: "1600000005.000200", thread_ts: strayThread });
+    // The reviewer's next reply in the real thread arrives after the stray one, so the stray one was handled first.
+    await replyAndWait(sessionId, thread, "Shorter");
+    assert.equal(logger.find("trigger event skipped: not a running review's thread", "event_id", strayEvent).length, 1);
+    assert.equal(decisionsOf(accountId).length, 0);
+    assert.equal((await userTexts(sessionId)).filter((text) => text.includes("1600000005.000200")).length, 0);
   });
 
   test(`${setup.harnessName}: an approval the server refuses posts the failure in the thread`, async () => {
@@ -353,101 +470,31 @@ export function registerSignupReviewScenarios(setup: SignupReviewScenarioSetup):
     // The model is told the outcome is unknown, not that the approval failed.
     assert.match((await resultsOf(sessionId, "approve_account")).at(-1) ?? "", /outcome (is )?unknown/);
     assert.equal((await client.describeFlow(sessionId)).status, "running");
-    // Once the ReviewAPI answers again, `[dex-cloud active]` shows the approval took effect: the review goes on to the email.
-    await pollUntil(async () => ((await userTexts(sessionId)).some((text) => text.startsWith("[dex-cloud active]")) ? true : undefined), {
-      description: "the poller reports the active account",
-      ...waitOptions,
-    });
-    await waitForIdle(sessionId);
-    assert.equal((await client.describeFlow(sessionId)).status, "running");
-    assert.ok(!threadReplies(sessionId).some((text) => /Decided in Dex Cloud admin/.test(text)));
+    // The approval did take effect, so the admins' `send` goes out once the ReviewAPI answers again.
     gmail.sendMessage().forFlow(sessionId).respond(sent("gmail-after-unknown"));
     await replyAndWait(sessionId, thread, "send");
     assert.equal(sendsOf(sessionId).length, 1);
-    await waitForStop(accountId);
+    await waitForEnd(sessionId);
   });
 
-  test(`${setup.harnessName}: a [slack <ts>] message that arrives twice is handled once`, async () => {
-    const { sessionId, thread } = await startReview("twice", 1710000230);
-    const drafts = () => threadReplies(sessionId).filter((text) => text.startsWith("*[draft ")).length;
-    const ts = await replyAndWait(sessionId, thread, "Shorter");
-    assert.equal(drafts(), 1);
-    // The same relay again, as an overlap of two ForwardReplies attempts could deliver it.
-    await sendAndWait(sessionId, `[slack ${ts}] <@${reviewerId}>: Shorter`);
-    assert.equal(drafts(), 1);
-  });
-
-  test(`${setup.harnessName}: a first turn that fails is retried with a back-off and the review completes`, async () => {
-    const { accountId, sessionId, thread } = await startReview(firstTurnFailingWord, 1710000240);
-    // The first turn and the first retry failed; the second retry posted the review.
-    const retries = (await userTexts(sessionId)).filter((text) => text.startsWith("[retry turn-"));
-    assert.deepEqual(retries.map((text) => text.split("]")[0]), ["[retry turn-1", "[retry turn-2"]);
-    assert.match(retries[0]!, /^\[retry turn-1\] The previous turn failed \(.+\)\. Handle this message again as new, then continue the review from where you left off:\nReview Dex Cloud account /);
-    // No thread existed while it failed, so nothing was posted in one.
-    assert.deepEqual(thread.pollerNotes(), []);
-    await replyAndWait(sessionId, thread, "approve");
-    gmail.sendMessage().forFlow(sessionId).respond(sent("gmail-retried"));
-    await replyAndWait(sessionId, thread, "send");
-    assert.equal(sendsOf(sessionId).length, 1);
-    await waitForStop(accountId);
-  });
-
-  test(`${setup.harnessName}: a later turn that fails is reported once in the thread and retried`, async () => {
-    const { sessionId, thread } = await startReview(laterTurnFailingWord, 1710000245);
-    const turns = await turnsOf(sessionId);
-    const ts = thread.reply(reviewerId, "Shorter");
-    // The failed turn is retried, and the retry handles the reviewer's message: draft 2.
-    await pollUntil(async () => (threadReplies(sessionId).some((text) => text.startsWith("*[draft 2]*")) ? true : undefined), { description: "draft 2 after the retry", ...waitOptions });
-    await waitForIdle(sessionId, turns + 1);
-    const failureNotes = thread.pollerNotes().filter((text) => text.startsWith("The agent's last turn failed: "));
-    assert.equal(failureNotes.length, 1);
-    assert.match(failureNotes[0]!, /It retries automatically; you can also reply here to retry now\.$/);
-    const texts = await userTexts(sessionId);
-    assert.equal(texts.filter((text) => text.startsWith("[retry turn-")).length, 1);
-    assert.equal(texts.filter((text) => text.startsWith(`[slack ${ts}]`)).length, 1);
-    assert.equal(threadReplies(sessionId).filter((text) => text.startsWith("*[draft ")).length, 1);
-  });
-
-  test(`${setup.harnessName}: another app's bot message gets no hint and no relay, and the cursor moves past it`, async () => {
-    const { accountId, sessionId, thread } = await startReview(passiveApplicantWord, 1710000255);
-    thread.reply("UOTHERBOT01", "approve", "B0OTHERBOT1");
-    const ts = await replyAndWait(sessionId, thread, "a note after the bot");
-    assert.deepEqual(thread.pollerNotes(), []);
-    assert.equal((await userTexts(sessionId)).filter((text) => text.includes("UOTHERBOT01")).length, 0);
-    assert.equal((await client.getAttributes(reviewPollerId(accountId), threadCursor))[0], ts);
-  });
-
-  test(`${setup.harnessName}: an approval retried after the turn failed is not made or confirmed twice`, async () => {
+  test(`${setup.harnessName}: an approval repeated after the turn failed is not made or confirmed twice`, async () => {
     const { accountId, sessionId, thread } = await startReview(failAfterApproveWord, 1710000256);
-    // The poller's account reads stay pending, so no [dex-cloud active] starts a turn of its own before the retry.
-    reviewApi.pollerSeesPending.add(accountId);
-    try {
-      const turns = await turnsOf(sessionId);
-      thread.reply(reviewerId, "approve");
-      await pollUntil(async () => ((await userTexts(sessionId)).some((text) => text.startsWith("[retry turn-")) ? true : undefined), { description: "the retry", ...waitOptions });
-      await waitForIdle(sessionId, turns + 1);
-    } finally {
-      reviewApi.pollerSeesPending.delete(accountId);
-    }
+    // The model call after approve_account fails, so that turn fails after its write; the reviewer asks again.
+    await replyAndWait(sessionId, thread, "approve");
+    assert.equal(decisionsOf(accountId).length, 1);
+    await replyAndWait(sessionId, thread, "approve");
     assert.equal(decisionsOf(accountId).length, 1);
     assert.equal(threadReplies(sessionId).filter((text) => text.startsWith("Approved ")).length, 1);
     assert.match((await resultsOf(sessionId, "approve_account")).at(-1) ?? "", /already done earlier in this review/);
   });
 
-  test(`${setup.harnessName}: an approval retried after an admin rejected the account says so and posts nothing`, async () => {
+  test(`${setup.harnessName}: an approval repeated after an admin rejected the account says so and posts nothing`, async () => {
     const { accountId, sessionId, thread } = await startReview(failAfterApproveWord, 1710000259);
-    reviewApi.pollerSeesPending.add(accountId);
-    try {
-      const turns = await turnsOf(sessionId);
-      thread.reply(reviewerId, "approve");
-      // The approval is made; while its turn fails, an admin rejects the account in Dex Cloud admin.
-      await pollUntil(() => (decisionsOf(accountId).length === 1 ? true : undefined), { description: "the approval", ...waitOptions });
-      reviewApi.decideElsewhere(accountId, "rejected");
-      await pollUntil(async () => ((await userTexts(sessionId)).some((text) => text.startsWith("[retry turn-")) ? true : undefined), { description: "the retry", ...waitOptions });
-      await waitForIdle(sessionId, turns + 1);
-    } finally {
-      reviewApi.pollerSeesPending.delete(accountId);
-    }
+    await replyAndWait(sessionId, thread, "approve");
+    assert.equal(decisionsOf(accountId).length, 1);
+    // While the approval's turn failed, an admin rejected the account in Dex Cloud admin.
+    reviewApi.decideElsewhere(accountId, "rejected");
+    await replyAndWait(sessionId, thread, "approve");
     assert.equal(decisionsOf(accountId).length, 1);
     assert.equal(threadReplies(sessionId).filter((text) => /^(Approved |Approval )/.test(text)).length, 1);
     const result = (await resultsOf(sessionId, "approve_account")).at(-1) ?? "";
@@ -455,17 +502,13 @@ export function registerSignupReviewScenarios(setup: SignupReviewScenarioSetup):
     assert.match(result, /now rejected in Dex Cloud/);
   });
 
-  test(`${setup.harnessName}: a send retried after the turn failed sends one email`, async () => {
+  test(`${setup.harnessName}: a send repeated after the turn failed sends one email`, async () => {
     const { sessionId, thread } = await startReview(failAfterSendWord, 1710000257);
     await replyAndWait(sessionId, thread, "approve");
-    // The poller reports the approval; the agent takes it for its own.
-    await pollUntil(async () => ((await userTexts(sessionId)).some((text) => text.startsWith("[dex-cloud active]")) ? true : undefined), { description: "the approval reported", ...waitOptions });
-    await waitForIdle(sessionId);
     gmail.sendMessage().forFlow(sessionId).default(sent("gmail-once"));
-    const turns = await turnsOf(sessionId);
-    thread.reply(reviewerId, "send");
-    await pollUntil(async () => ((await userTexts(sessionId)).some((text) => text.startsWith("[retry turn-")) ? true : undefined), { description: "the send's retry", ...waitOptions });
-    await waitForIdle(sessionId, turns + 1);
+    await replyAndWait(sessionId, thread, "send");
+    assert.equal(sendsOf(sessionId).length, 1);
+    await replyAndWait(sessionId, thread, "send");
     assert.equal(sendsOf(sessionId).length, 1);
     assert.match((await resultsOf(sessionId, "send_welcome_email")).at(-1) ?? "", /refused: the welcome email for draft 1 was already sent in this review/);
     assert.equal(threadReplies(sessionId).filter((text) => text.startsWith("Sent the welcome email")).length, 1);
@@ -482,42 +525,12 @@ export function registerSignupReviewScenarios(setup: SignupReviewScenarioSetup):
     await pollUntil(() => (sendsOf(sessionId).length === 2 ? true : undefined), { description: "the send after time travel", ...waitOptions });
   });
 
-  test(`${setup.harnessName}: someone who is not a listed reviewer gets one hint and is not relayed`, async () => {
-    const { sessionId, thread } = await startReview(passiveApplicantWord, 1710000250);
-    const hint = `<@${bystanderId}>, only listed reviewers' replies are read; ask an admin to add you to SIGNUP_REVIEWER_SLACK_IDS.`;
-    thread.reply(bystanderId, "approve please");
-    await pollUntil(() => (thread.pollerNotes().includes(hint) ? true : undefined), { description: "the hint", ...waitOptions });
-    // A second reply from the same person gets no second hint; a reviewer's reply after it is still relayed.
-    thread.reply(bystanderId, "hello?");
-    await replyAndWait(sessionId, thread, "a note");
-    assert.deepEqual(thread.pollerNotes().filter((text) => text.includes("only listed reviewers")), [hint]);
-    assert.equal((await userTexts(sessionId)).filter((text) => text.includes(bystanderId)).length, 0);
-  });
-
-  test(`${setup.harnessName}: the agent's own approval reported as [dex-cloud active], once, does no harm, even after a hold`, async () => {
-    const { accountId, sessionId, thread } = await startReview("heldapproval", 1710000220);
-    await replyAndWait(sessionId, thread, "approve");
-    assert.equal(reviewApi.accountOf(accountId)?.status, "active");
-    await replyAndWait(sessionId, thread, "hold");
-    await pollUntil(async () => ((await userTexts(sessionId)).some((text) => text.startsWith("[dex-cloud active]")) ? true : undefined), {
-      description: "the poller reports the active account",
-      ...waitOptions,
-    });
-    // Many account checks later the notice is still there once, and the session still waits for `send`.
-    await new Promise((resolve) => setTimeout(resolve, 3_000));
-    await waitForIdle(sessionId);
-    assert.equal((await userTexts(sessionId)).filter((text) => text.startsWith("[dex-cloud")).length, 1);
-    assert.equal((await client.describeFlow(sessionId)).status, "running");
-    assert.ok(!threadReplies(sessionId).some((text) => /Decided in Dex Cloud admin/.test(text)));
-    gmail.sendMessage().forFlow(sessionId).respond(sent("gmail-held"));
-    await replyAndWait(sessionId, thread, "send");
-    assert.equal(sendsOf(sessionId).length, 1);
-    await waitForStop(accountId);
-  });
-
   test(`${setup.harnessName}: a confirmation that fails to post leaves the approval as it is`, async () => {
     const { accountId, sessionId, thread } = await startReview("lostpost", 1710000250);
-    thread.failNextBotReply();
+    slack
+      .postThreadReply()
+      .forFlow(sessionId)
+      .respond(postThreadReplyUncertain({ message: { channelId, timestamp: "", threadTimestamp: thread.rootTs, userId: botUserId, text: "" } }, failure("postThreadReply", "lost")));
     await replyAndWait(sessionId, thread, "approve");
     assert.equal(reviewApi.accountOf(accountId)?.status, "active");
     assert.match((await resultsOf(sessionId, "approve_account")).at(-1) ?? "", /"status":"approved"/);
@@ -531,7 +544,7 @@ export function registerSignupReviewScenarios(setup: SignupReviewScenarioSetup):
     assert.equal(reviewApi.accountOf(accountId)?.status, "rejected");
     assert.ok(threadReplies(sessionId).includes(`Rejected ${applicant(accountId)}: Looks like &lt;spam&gt;.`));
     assert.equal(sendsOf(sessionId).length, 0);
-    await waitForStop(accountId);
+    await waitForEnd(sessionId);
   });
 
   test(`${setup.harnessName}: a rejection the server refuses posts the failure in the thread`, async () => {
@@ -543,7 +556,7 @@ export function registerSignupReviewScenarios(setup: SignupReviewScenarioSetup):
   });
 
   test(`${setup.harnessName}: a send that fails says so in the thread, and the review ends`, async () => {
-    const { accountId, sessionId, thread } = await startReview("unconfirmed", 1710000500);
+    const { sessionId, thread } = await startReview("unconfirmed", 1710000500);
     await replyAndWait(sessionId, thread, "approve");
     gmail
       .sendMessage()
@@ -552,11 +565,11 @@ export function registerSignupReviewScenarios(setup: SignupReviewScenarioSetup):
     await replyAndWait(sessionId, thread, "send");
     assert.equal(sendsOf(sessionId).length, 1);
     assert.ok(threadReplies(sessionId).includes("Sending the welcome email failed: connection reset. Check Sent Mail; if nothing went out, send it manually."));
-    await waitForStop(accountId);
+    await waitForEnd(sessionId);
   });
 
   test(`${setup.harnessName}: a send Gmail rejects is a definite failure: nothing was sent`, async () => {
-    const { accountId, sessionId, thread } = await startReview("gmailoff", 1710000520);
+    const { sessionId, thread } = await startReview("gmailoff", 1710000520);
     await replyAndWait(sessionId, thread, "approve");
     gmail
       .sendMessage()
@@ -568,17 +581,16 @@ export function registerSignupReviewScenarios(setup: SignupReviewScenarioSetup):
     assert.ok(!threadReplies(sessionId).some((text) => /Check Sent Mail/.test(text)));
     // Recorded as failed with the reason, not as an unknown outcome.
     assert.match((await resultsOf(sessionId, "send_welcome_email")).at(-1) ?? "", /send_welcome_email failed and nothing was sent: Gmail rejected the message \(AUTHORIZATION\)/);
-    await waitForStop(accountId);
+    await waitForEnd(sessionId);
   });
 
   test(`${setup.harnessName}: a draft the same as the latest one is refused`, async () => {
     const { sessionId, thread } = await startReview("samedraft", 1710000540);
-    const drafts = () => threadReplies(sessionId).filter((text) => text.startsWith("*[draft ")).length;
     await replyAndWait(sessionId, thread, "Shorter");
-    assert.equal(drafts(), 1);
+    assert.equal(drafts(sessionId), 1);
     // The same feedback again makes the scripted model write the same draft.
     await replyAndWait(sessionId, thread, "Shorter");
-    assert.equal(drafts(), 1);
+    assert.equal(drafts(sessionId), 1);
     assert.match((await resultsOf(sessionId, "post_draft")).at(-1) ?? "", /refused: this draft is the same as draft 2/);
   });
 
@@ -604,23 +616,6 @@ export function registerSignupReviewScenarios(setup: SignupReviewScenarioSetup):
     assert.match(sendsOf(sessionId)[0]!.input.textBody, /Revised: shorter/);
   });
 
-  test(`${setup.harnessName}: an account decided in Dex Cloud admin ends the review, through a busy ReviewAPI`, async () => {
-    const { accountId, sessionId } = await startReview("elsewhere", 1710000700);
-    const turns = await turnsOf(sessionId);
-    reviewApi.decideElsewhere(accountId, "active");
-    // A 503 skips a round of the poller; it neither fails nor ends it.
-    reviewApi.failingGets = 2;
-    await pollUntil(async () => ((await userTexts(sessionId)).some((text) => text.startsWith("[dex-cloud active]")) ? true : undefined), {
-      description: "the poller reports the decision",
-      ...waitOptions,
-    });
-    await waitForIdle(sessionId, turns);
-    assert.equal((await userTexts(sessionId)).filter((text) => text.startsWith("[dex-cloud active]")).length, 1);
-    assert.match(threadReplies(sessionId).at(-1)!, /Decided in Dex Cloud admin/);
-    assert.equal(decisionsOf(accountId).length, 0);
-    await waitForStop(accountId);
-  });
-
   test(`${setup.harnessName}: sign-ups registered before SIGNUP_REVIEW_SINCE are left alone`, async () => {
     const accountId = `acctold${Date.now().toString(36)}`;
     reviewApi.addPendingAccount({ accountId, email: "old@example.com", registeredAt: "2020-01-01T00:00:00Z" });
@@ -628,54 +623,27 @@ export function registerSignupReviewScenarios(setup: SignupReviewScenarioSetup):
     await assert.rejects(client.describeFlow(reviewSessionId(accountId)));
   });
 
-  test(`${setup.harnessName}: the poller resumes after a Worker restart and relays each reply once`, async () => {
+  // Last: it replaces the runner and its index, as a restarted process would have them.
+  test(`${setup.harnessName}: after a restart, a reply that arrived while the Worker was down reaches its review once`, async () => {
     const { sessionId, thread } = await startReview(passiveApplicantWord, 1710000900);
     const firstTs = await replyAndWait(sessionId, thread, "first note");
+    await stopRunner();
     await worker.close();
-    const secondTs = thread.reply(reviewerId, "second note");
+    // A new process: its runner's thread index is empty, and the Worker is still down when the reply arrives.
+    const restarted = new ReviewSessions();
+    restarted.connect(client, sessionFlow);
+    runner = startRunner(restarted);
+    const before = events.acknowledged.length;
+    const { ts: secondTs, eventId } = thread.reply(reviewerId, "second note");
+    // Acknowledged once the durable inbox recorded it; its delivery waits for the Worker.
+    await pollUntil(() => (events.acknowledged.length > before ? true : undefined), { description: "the reply received while the Worker is down", ...waitOptions });
+    await sleep(2_000);
     worker = await startWorker();
-    await pollUntil(async () => ((await userTexts(sessionId)).some((text) => text.startsWith(`[slack ${secondTs}]`)) ? true : undefined), {
-      description: "the relay after the Worker restart",
-      ...waitOptions,
-    });
+    await waitForReply(sessionId, secondTs);
+    assert.equal(logger.find("trigger event skipped: not a running review's thread", "event_id", eventId).length, 0);
     const relayed = await userTexts(sessionId);
     for (const ts of [firstTs, secondTs]) {
       assert.equal(relayed.filter((text) => text.startsWith(`[slack ${ts}]`)).length, 1);
     }
-  });
-
-  test(`${setup.harnessName}: a round abandoned by its timeout writes nothing`, async () => {
-    const { accountId, sessionId } = await startReview("slowround", 1710001600);
-    reviewApi.decideElsewhere(accountId, "active");
-    // Every account read takes longer than a round may: each such round is abandoned before it reports.
-    reviewApi.getDelayMs = 3_000;
-    try {
-      await new Promise((resolve) => setTimeout(resolve, 5_000));
-      assert.equal((await userTexts(sessionId)).filter((text) => text.startsWith("[dex-cloud")).length, 0);
-    } finally {
-      reviewApi.getDelayMs = 0;
-    }
-    await pollUntil(async () => ((await userTexts(sessionId)).some((text) => text.startsWith("[dex-cloud active]")) ? true : undefined), {
-      description: "the report once rounds are fast again",
-      ...waitOptions,
-    });
-    assert.equal((await userTexts(sessionId)).filter((text) => text.startsWith("[dex-cloud active]")).length, 1);
-  });
-
-  test(`${setup.harnessName}: the poller reads one thread page a round and moves on when a page is full`, async () => {
-    const { accountId, sessionId, thread } = await startReview(passiveApplicantWord, 1710001700);
-    // 15 bystander messages fill the first page with the root; the reviewer's reply lands on page 2.
-    for (let index = 0; index < 15; index++) {
-      thread.reply(bystanderId, `chatter ${index}`);
-    }
-    const replyTs = await replyAndWait(sessionId, thread, "a note on page two");
-    assert.equal((await client.getAttributes(reviewPollerId(accountId), threadPage))[0], "page-2");
-    const reads = slack.listThreadMessages().calls().filter((call) => call.flowId === reviewPollerId(accountId));
-    const firstOnPageTwo = reads.findIndex((call) => call.input.cursor === "page-2");
-    assert.ok(firstOnPageTwo > 0);
-    // Once on page 2, no round reads the thread from its start again.
-    assert.ok(reads.slice(firstOnPageTwo).every((call) => call.input.cursor === "page-2"));
-    assert.ok(reads.every((call) => call.input.pageSize === 15));
-    assert.deepEqual((await userTexts(sessionId)).filter((text) => text.startsWith("[slack ")).map((text) => text.split("]")[0]), [`[slack ${replyTs}`]);
   });
 }

@@ -1,8 +1,9 @@
 // The signup review agent, shared by every harness: its prompt and its tools.
-// The agent decides from the reviewers' replies that the poller relays; the tools check only what the ReviewAPI says
-// about the account, and approve_account, reject_account and send_welcome_email post their outcome in the thread.
+// The agent decides from the reviewers' replies, which the Slack reply Trigger delivers; the tools check only what the
+// ReviewAPI says about the account, and approve_account, reject_account and send_welcome_email post their outcome in
+// the thread.
 
-import { createCall, newMutationBranch, runMutation, runQuery, type Call, type Mutation, type MutationAttempt } from "@superdurable/connectors-sdk";
+import { createCall, newMutationBranch, runMutation, type Call, type Mutation, type MutationAttempt } from "@superdurable/connectors-sdk";
 import gmailManifest from "@superdurable/connector-google-gmail/dex-connector.json" with { type: "json" };
 import type { GmailConnection } from "@superdurable/connector-google-gmail";
 import slackManifest from "@superdurable/connector-slack/dex-connector.json" with { type: "json" };
@@ -13,8 +14,7 @@ import { z } from "zod";
 
 import type { ProfileSources } from "./profile-sources.js";
 import { ReviewApiError, type Account, type ReviewApiClient } from "./review-api.js";
-import { accountIdOf, earlierDecision, refusedPrefix, reviewSessionId, succeededOutput, wasDraftSent, type ReviewSessions } from "./review-state.js";
-import type { ReviewThread } from "./review-thread-poller.js";
+import { accountIdOf, earlierDecision, refusedPrefix, reviewSessionId, succeededOutput, wasDraftSent, type ReviewSessions, type ReviewThread } from "./review-state.js";
 
 export const signupAgentPrompt = `You review sign-ups for Dex Cloud, a hosted platform for building durable applications and AI agents, together with the admins in Slack.
 
@@ -28,12 +28,10 @@ Procedure:
    - "hold": do nothing until the next reply; it cancels a decision or send you have not made yet.
    - Anything else is feedback on the email: write one new draft and call post_draft once. Post exactly one new draft per feedback message, and never post a draft that is unchanged. If a posted draft has a mistake, wait for the reviewers' feedback instead of posting more drafts to correct it.
    - approve_account, reject_account and send_welcome_email post their own confirmation or failure in the thread: never repeat it. When approve_account or reject_account reports an unknown outcome, do not call it again unless an admin asks again; the tool already asked the admins to check Dex Cloud admin.
-   - Handle each "[slack <ts>]" message at most once: a message whose ts you have already seen is a repeat; ignore it.
-   - A message "[retry turn-<n>] The previous turn failed ..." means your last turn failed before it finished. Handle the message it quotes as new, even if you saw it before, and continue the review from where you left off; never repeat a write that already succeeded.
+   - Handle each "[slack <ts>]" message at most once: a message whose ts you have already seen is a repeat; ignore it. An admin may repeat a request with a new message, such as after a turn of yours failed: handle it, and the tools tell you when the write already happened.
    - When you mention a draft, mean the latest one, and never number drafts in your own text: the tools number them.
-   - Messages "[dex-cloud <status>]" report that the account is no longer pending in Dex Cloud. When the status is the result of your own successful approve_account or reject_account, ignore the message and carry on. When it matches an approve_account or reject_account you called whose outcome was unknown ("active" after approve_account, "rejected" after reject_account), that decision took effect: say so briefly with reply_in_thread, then go on as after a successful decision (after an approval, wait for "send"; after a rejection, post the summary and finish). Otherwise the account was decided in Dex Cloud admin: say so with reply_in_thread and finish.
    A tool that refuses tells you why; explain it briefly with reply_in_thread when it helps the admins. Be concise.
-5. When the email was sent or its send failed, the account was rejected, or the account was decided elsewhere, post a one-line summary with reply_in_thread, then call finish_review last: it ends the session.`;
+5. When the email was sent or its send failed, the account was rejected, or a tool reports that the account was decided in Dex Cloud admin, post a one-line summary with reply_in_thread, then call finish_review last: it ends the session.`;
 
 /** The first message of a review session: the applicant's sign-up data, as data. */
 export function firstReviewMessage(account: Account): string {
@@ -112,7 +110,7 @@ export function createSignupTools(services: SignupServices): SignupTool[] {
         if (account.status === "pending_approval") {
           refuse("the account is still waiting for a decision");
         }
-        // A session never ends on its own: this cancels it, as the tool's last act, and the poller then completes.
+        // A session never ends on its own: this cancels it, as the tool's last act.
         await services.sessions.endSession(accountId, "review finished");
         return { status: "finished", accountStatus: account.status };
       },
@@ -148,25 +146,15 @@ const failureOf = (outcome: Outcome) => outcome.failure?.message ?? `the provide
  * Posts an outcome in the review thread, best effort: a failed post only logs a warning and never changes the tool's
  * result. `post` makes the connector call inside the tool's Step.
  */
-async function confirm(thread: ReviewThread, text: string, post: (input: ThreadReplyInput) => Promise<Outcome>): Promise<void> {
+async function confirm(channelId: string, thread: ReviewThread, text: string, post: (input: ThreadReplyInput) => Promise<Outcome>): Promise<void> {
   try {
-    const outcome = await post({ channelId: thread.channel, threadTimestamp: thread.ts, text });
+    const outcome = await post({ channelId, threadTimestamp: thread.ts, text });
     if (!isSent(outcome)) {
       console.warn(`signup review: the confirmation in thread ${thread.ts} was not posted: ${failureOf(outcome)}`);
     }
   } catch (error: unknown) {
     console.warn(`signup review: the confirmation in thread ${thread.ts} was not posted: ${messageOf(error)}`);
   }
-}
-
-/** Reads which Slack app this connection posts as; queries run inside the tool Step under its call context. */
-async function slackIdentity(services: SignupServices, call: Call) {
-  const operation = services.slack.operations.getWorkspaceIdentity();
-  const identity = await runQuery(operation, createCall(call.context, services.slack.reference, operation.definition().operation), {});
-  if (identity.branch !== "read") {
-    throw new Error(`reading the Slack app's identity ended ${identity.branch}`);
-  }
-  return identity.value;
 }
 
 /** A busy or unreachable ReviewAPI: the request may or may not have been applied. */
@@ -260,7 +248,7 @@ export function createSignupConnectorTools(services: SignupServices): ToolSource
   const replySchema = z.object({ text: z.string().min(1).max(3_000) });
   const rejectSchema = z.object({ reason: z.string().min(1).max(500).describe("The reviewer's reason for the rejection.") });
   const accountOf = (call: Call) => accountIdOf(call.context.flowId);
-  const requireThread = async (accountId: string) => (await sessions.read(accountId)).thread ?? refuse("call post_review first");
+  const channelId = services.slackChannelId;
   const channelMessage = slack.operations.postChannelMessage();
   const threadReply = slack.operations.postThreadReply();
   const sendMessage = gmail.operations.sendMessage();
@@ -268,37 +256,33 @@ export function createSignupConnectorTools(services: SignupServices): ToolSource
   const postReview = write(channelMessage, async (call, args) => {
     const accountId = accountOf(call);
     const review = reviewSchema.parse(args);
-    const { text, botUserId } = await beforeDispatch(async () => {
-      const existing = await sessions.read(accountId);
+    const text = await beforeDispatch(async () => {
+      const existing = await sessions.review(accountId);
       if (existing.thread !== undefined) {
         refuse(`the review is already posted (thread ${existing.thread.ts}); use post_draft or reply_in_thread`);
       }
-      const identity = await slackIdentity(services, call);
-      if (sessions.reviewerIds.has(identity.botUserId)) {
-        refuse("SIGNUP_REVIEWER_SLACK_IDS lists the Slack app's own user; remove it, the app must not decide on its own reviews");
+      if (existing.isReviewPosted) {
+        refuse("an earlier post_review may have posted the review; never post it again, the admins decide in Dex Cloud admin");
       }
       const account = await services.reviewApi.getAccount(accountId, call.context.cancellationSignal);
-      return { text: reviewPost(account, review, services.harnessLabel, reviewSessionId(accountId)), botUserId: identity.botUserId };
+      return reviewPost(account, review, services.harnessLabel, reviewSessionId(accountId));
     });
-    const attempt = await channelMessage.invoke(call, { channelId: services.slackChannelId, text });
+    const attempt = await channelMessage.invoke(call, { channelId, text });
     if (attempt.kind !== "branch" || attempt.branch !== "sent") {
       return attempt;
     }
-    const message = attempt.value.message;
-    // From now on the poller holds the thread and the latest draft, and the other tools read them there.
-    await sessions.startPoller(
-      accountId,
-      { channel: message.channelId || services.slackChannelId, ts: message.timestamp, botUserId: message.userId || botUserId },
-      { number: 1, subject: review.emailSubject, body: review.emailBody },
-    );
-    return { ...attempt, value: { ...attempt.value, draft: { number: 1 } } };
+    const thread = { ts: attempt.value.message.timestamp };
+    // The result is the session's record of the review: its thread, which the other tools and the reply Trigger read,
+    // and draft 1. This process knows the thread at once; another one looks it up in this record.
+    sessions.rememberThread(thread.ts, accountId);
+    return { ...attempt, value: { ...attempt.value, thread, draft: { number: 1 }, email: { subject: review.emailSubject, body: review.emailBody } } };
   });
 
   const postDraft = write(threadReply, async (call, args) => {
     const accountId = accountOf(call);
     const draft = draftSchema.parse(args);
     const { thread, number, isApproved } = await beforeDispatch(async () => {
-      const record = await sessions.read(accountId);
+      const record = await sessions.review(accountId);
       const thread = record.thread ?? refuse("call post_review first");
       if (record.latestDraft !== undefined && record.latestDraft.subject === draft.subject && record.latestDraft.body === draft.body) {
         refuse(`this draft is the same as draft ${record.latestDraft.number}, already posted; wait for the reviewers' feedback`);
@@ -312,21 +296,17 @@ export function createSignupConnectorTools(services: SignupServices): ToolSource
     });
     const footer = isApproved ? "Reply `send` to send this draft, or write what to change." : "Approve the account first (`approve`), then reply `send`, or write what to change.";
     const text = `*[draft ${number}]*\n${emailBlock(draft.subject, draft.body)}\n${footer}`;
-    const attempt = await threadReply.invoke(call, { channelId: thread.channel, threadTimestamp: thread.ts, text });
+    const attempt = await threadReply.invoke(call, { channelId, threadTimestamp: thread.ts, text });
     if (attempt.kind !== "branch" || attempt.branch !== "sent") {
       return attempt;
     }
-    try {
-      await sessions.recordDraft(accountId, { number, ...draft });
-    } catch (error: unknown) {
-      throw new ToolExecutionError(`draft ${number} was posted but not recorded (${messageOf(error)}); post it again with post_draft, or send_welcome_email sends the earlier draft`);
-    }
-    return { ...attempt, value: { ...attempt.value, draft: { number } } };
+    // The result is the session's record of the draft, the one send_welcome_email sends until a newer one.
+    return { ...attempt, value: { ...attempt.value, draft: { number }, email: draft } };
   });
 
   const replyInThread = write(threadReply, async (call, args) => {
-    const thread = await beforeDispatch(() => requireThread(accountOf(call)));
-    return threadReply.invoke(call, { channelId: thread.channel, threadTimestamp: thread.ts, text: escapeSlack(replySchema.parse(args).text) });
+    const thread = await beforeDispatch(async () => (await sessions.review(accountOf(call))).thread ?? refuse("call post_review first"));
+    return threadReply.invoke(call, { channelId, threadTimestamp: thread.ts, text: escapeSlack(replySchema.parse(args).text) });
   });
 
   /** approve_account and reject_account: the decision, then its confirmation or failure as this call's thread reply. */
@@ -335,8 +315,9 @@ export function createSignupConnectorTools(services: SignupServices): ToolSource
       const accountId = accountOf(call);
       const reason = decision === "reject" ? rejectSchema.parse(args).reason : "";
       const { thread, earlier, current } = await beforeDispatch(async () => {
-        const thread = await requireThread(accountId);
-        const earlier = succeededOutput((await sessions.toolRecords(accountId)).records, `${decision}_account`);
+        const record = await sessions.review(accountId);
+        const thread = record.thread ?? refuse("call post_review first");
+        const earlier = succeededOutput(record.history.records, `${decision}_account`);
         // A read only: the account as it is now decides what an earlier success still means.
         const current = earlier === undefined ? undefined : await services.reviewApi.getAccount(accountId, call.context.cancellationSignal);
         return { thread, earlier, current };
@@ -344,7 +325,7 @@ export function createSignupConnectorTools(services: SignupServices): ToolSource
       if (earlier !== undefined && current !== undefined) {
         const verdict = earlierDecision(decision, current.status);
         if (verdict === "same") {
-          // This decision already succeeded in this session, as after a retried turn: no second request or confirmation.
+          // This decision already succeeded in this session, as after a failed turn: no second request or confirmation.
           return newMutationBranch("sent", { ...parseObject(earlier), accountStatus: current.status, note: "already done earlier in this review; nothing was posted again" });
         }
         if (verdict === "changed") {
@@ -364,14 +345,15 @@ export function createSignupConnectorTools(services: SignupServices): ToolSource
         if (error instanceof DecisionOutcomeUnknown) {
           // The request went out and the ReviewAPI stayed busy: the account may be decided. Dex records outcome_unknown
           // and never retries the call, and the model is told its outcome is unknown.
-          await confirm(thread, `${noun} outcome unknown: ${oneLine(error.message, "unknown error")}. Check the account in Dex Cloud admin; the review continues.`, post);
+          await confirm(channelId, thread, `${noun} outcome unknown: ${oneLine(error.message, "unknown error")}. Check the account in Dex Cloud admin; the review continues.`, post);
           throw new ToolOutcomeUnknownError(`${decision}_account outcome unknown: ${error.message}`);
         }
-        await confirm(thread, `${noun} failed: ${oneLine(messageOf(error), "unknown error")}.`, post);
+        await confirm(channelId, thread, `${noun} failed: ${oneLine(messageOf(error), "unknown error")}.`, post);
         throw new ToolExecutionError(`${decision}_account failed: ${messageOf(error)}`);
       }
       const applicant = `${oneLine(account.displayName, "(no name)")} (${oneLine(account.email, "")})`;
       await confirm(
+        channelId,
         thread,
         decision === "approve" ? `Approved ${applicant} on Dex Cloud. Reply \`send\` to email the welcome message.` : `Rejected ${applicant}: ${oneLine(reason, "no reason given")}.`,
         post,
@@ -382,7 +364,7 @@ export function createSignupConnectorTools(services: SignupServices): ToolSource
   const sendWelcomeEmail = write(sendMessage, async (call) => {
     const accountId = accountOf(call);
     const { thread, draft, account } = await beforeDispatch(async () => {
-      const record = await sessions.read(accountId);
+      const record = await sessions.review(accountId);
       const thread = record.thread ?? refuse("call post_review first");
       const draft = record.latestDraft ?? refuse("no draft is posted");
       const account = await services.reviewApi.getAccount(accountId, call.context.cancellationSignal);
@@ -390,8 +372,8 @@ export function createSignupConnectorTools(services: SignupServices): ToolSource
         refuse(`the account is ${account.status}, not approved`);
       }
       // The session's own records say whether this draft was sent already, for example by a turn that failed after
-      // the send and was retried. Time travel of the session rewinds them, so a deliberate re-send stays possible.
-      if (wasDraftSent(await sessions.toolRecords(accountId), draft.number)) {
+      // the send. Time travel of the session rewinds them, so a deliberate re-send stays possible.
+      if (wasDraftSent(record.history, draft.number)) {
         refuse(`the welcome email for draft ${draft.number} was already sent in this review`);
       }
       return { thread, draft, account };
@@ -403,21 +385,21 @@ export function createSignupConnectorTools(services: SignupServices): ToolSource
     try {
       attempt = await sendMessage.invoke(call, { to: [account.email], subject: draft.subject, textBody: draft.body });
     } catch (error: unknown) {
-      await confirm(thread, failed(messageOf(error)), post);
+      await confirm(channelId, thread, failed(messageOf(error)), post);
       throw error;
     }
     if (attempt.kind === "branch" && attempt.branch === "providerRejected") {
       // Gmail conclusively rejected the message, so nothing was sent. Thrown here, it is recorded as failed; returned,
       // the connector source would record outcome_unknown, since the fence cannot prove that no request went out.
       const reason = attempt.failure === undefined ? "Gmail rejected the message" : `${attempt.failure.message} (${attempt.failure.kind})`;
-      await confirm(thread, `Sending the welcome email failed: ${oneLine(reason, "Gmail rejected the message")}. Nothing was sent.`, post);
+      await confirm(channelId, thread, `Sending the welcome email failed: ${oneLine(reason, "Gmail rejected the message")}. Nothing was sent.`, post);
       throw new ToolExecutionError(`send_welcome_email failed and nothing was sent: ${reason}`);
     }
     if (attempt.kind !== "branch" || attempt.branch !== "sent") {
-      await confirm(thread, failed(failureOf(attempt)), post);
+      await confirm(channelId, thread, failed(failureOf(attempt)), post);
       return attempt;
     }
-    await confirm(thread, `Sent the welcome email to ${oneLine(account.email, "the applicant")}.`, post);
+    await confirm(channelId, thread, `Sent the welcome email to ${oneLine(account.email, "the applicant")}.`, post);
     return { ...attempt, value: { ...attempt.value, draft: { number: draft.number } } };
   });
 

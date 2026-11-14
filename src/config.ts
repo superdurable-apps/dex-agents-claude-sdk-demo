@@ -22,8 +22,7 @@ export interface SignupAgentConfig {
   readonly watchIntervalMs: number;
   /** Only sign-ups registered at or after this time are reviewed. */
   readonly reviewSince: Date;
-  readonly threadPollIntervalMs: number;
-  /** The Worker's execution slots: each open review's poller holds one while it polls. */
+  /** The Worker's execution slots: each running turn or tool call uses one; a review that waits holds none. */
   readonly workerSlots: number;
 }
 
@@ -74,7 +73,6 @@ export function loadSignupAgentConfig(environment: NodeJS.ProcessEnv = process.e
     claudeCliPath: optional("SIGNUP_AGENT_CLAUDE_CLI"),
     githubToken: optional("GITHUB_TOKEN"),
     watchIntervalMs: positiveInteger(optional("SIGNUP_WATCH_INTERVAL_SECONDS") ?? "30", "SIGNUP_WATCH_INTERVAL_SECONDS") * 1_000,
-    threadPollIntervalMs: positiveInteger(optional("SIGNUP_THREAD_POLL_SECONDS") ?? "60", "SIGNUP_THREAD_POLL_SECONDS") * 1_000,
     workerSlots: positiveInteger(optional("SIGNUP_WORKER_SLOTS") ?? "64", "SIGNUP_WORKER_SLOTS", "slots"),
   };
 }

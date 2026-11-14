@@ -20,13 +20,9 @@ export const rejectedApplicantWord = "spammy";
 export const passiveApplicantWord = "passive";
 /** Applicants whose email contains this word make the model post a draft and a note in one response. */
 export const multiCallApplicantWord = "multi";
-/** Applicants whose email contains this word make the first turn fail, and its first retry too. */
-export const firstTurnFailingWord = "firstfail";
-/** Applicants whose email contains this word make the turn of the reviewer's "Shorter" fail once. */
-export const laterTurnFailingWord = "laterfail";
-/** Applicants whose email contains this word make the model call right after approve_account fail, until a retry. */
+/** Applicants whose email contains this word make the model call right after the first approve_account fail. */
 export const failAfterApproveWord = "failafterapprove";
-/** Applicants whose email contains this word make the model call right after send_welcome_email fail, until a retry. */
+/** Applicants whose email contains this word make the model call right after the first send_welcome_email fail. */
 export const failAfterSendWord = "failaftersend";
 /** Applicants whose email contains this word make the model only send on `send`, and keep the review open. */
 export const stayAfterSendWord = "stayaftersend";
@@ -47,23 +43,11 @@ const tool = (name: string, args: Record<string, unknown> = {}): ScriptedStep =>
 const tools = (...steps: ScriptedStep[]): ScriptedStep => ({ kind: "tools", calls: steps.flatMap((step) => (step.kind === "tools" ? step.calls : [])) });
 
 /** Decides the next step from the session's user messages, oldest first, and the tool results since the last one. */
-export function decideNextStep(rawUserTexts: readonly string[], seen: readonly SeenResult[]): ScriptedStep {
-  // A retry message quotes the failed turn's message after its first line; the model handles that message as new.
-  const isRetry = (text: string) => text.startsWith("[retry ");
-  const userTexts = rawUserTexts.map((text) => (isRetry(text) ? text.slice(text.indexOf("\n") + 1) : text));
-  const retries = rawUserTexts.filter(isRetry).length;
-  const isRetryTurn = isRetry(rawUserTexts.at(-1) ?? "");
+export function decideNextStep(userTexts: readonly string[], seen: readonly SeenResult[]): ScriptedStep {
   const userText = userTexts.at(-1) ?? "";
   const first = userTexts.find((text) => text.startsWith("Review Dex Cloud account")) ?? "";
   const facts = JSON.parse(first.slice(first.indexOf("{"), first.lastIndexOf("}") + 1) || "{}") as { email?: string; profileUrl?: string };
   const email = facts.email ?? "";
-  // Injected model failures: every model call of a turn fails, so the turn fails, until enough retries arrived.
-  if (seen.length === 0 && email.includes(firstTurnFailingWord) && userText === first && retries < 2) {
-    return { kind: "fail" };
-  }
-  if (seen.length === 0 && email.includes(laterTurnFailingWord) && /^\[slack [\d.]+\] <@\w+>: shorter$/i.test(userText) && retries < 1) {
-    return { kind: "fail" };
-  }
   if (userText === first) {
     const login = /github\.com\/([A-Za-z0-9-]+)/.exec(facts.profileUrl ?? "")?.[1] ?? "ada-builds";
     const isRejected = email.includes(rejectedApplicantWord);
@@ -76,7 +60,7 @@ export function decideNextStep(rawUserTexts: readonly string[], seen: readonly S
     return follow([tool("github_user", { login }), review], seen);
   }
   const slackTs = /^\[slack ([\d.]+)\]/.exec(userText)?.[1];
-  if (slackTs !== undefined && !isRetryTurn && userTexts.slice(0, -1).some((text) => text.startsWith(`[slack ${slackTs}]`))) {
+  if (slackTs !== undefined && userTexts.slice(0, -1).some((text) => text.startsWith(`[slack ${slackTs}]`))) {
     // As the prompt says: a repeated ts is ignored.
     return { kind: "answer", text: "Already handled." };
   }
@@ -85,8 +69,11 @@ export function decideNextStep(rawUserTexts: readonly string[], seen: readonly S
     return { kind: "answer", text: "Noted." };
   }
   const reply = slack?.trim().toLowerCase();
+  // How many reviewer replies so far said the same as this one, this one included.
+  const sameReplies = userTexts.filter((text) => /^\[slack [\d.]+\] <@\w+>: ([\s\S]*)$/.exec(text)?.[1]?.trim().toLowerCase() === reply).length;
   if (reply === "approve") {
-    if (email.includes(failAfterApproveWord) && !isRetryTurn && seen.length >= 1) {
+    // Injected failure: the model call after the first approve_account fails, so that turn fails after its write.
+    if (email.includes(failAfterApproveWord) && sameReplies === 1 && seen.length >= 1) {
       return { kind: "fail" };
     }
     // The tool posts its own confirmation; the model says nothing more.
@@ -97,7 +84,7 @@ export function decideNextStep(rawUserTexts: readonly string[], seen: readonly S
     return follow([tool("reject_account", { reason: slack!.trim().slice("reject ".length) }), ...(isRejected ? [tool("reply_in_thread", { text: "Review done: rejected." }), tool("finish_review")] : [])], seen);
   }
   if (reply === "send" && (email.includes(failAfterSendWord) || email.includes(stayAfterSendWord))) {
-    if (email.includes(failAfterSendWord) && !isRetryTurn && seen.length >= 1) {
+    if (email.includes(failAfterSendWord) && sameReplies === 1 && seen.length >= 1) {
       return { kind: "fail" };
     }
     return follow([tool("send_welcome_email")], seen);
@@ -106,15 +93,6 @@ export function decideNextStep(rawUserTexts: readonly string[], seen: readonly S
     const isSent = seen[0]?.output.includes("messageId") === true;
     const isRefused = seen[0]?.output.includes("refused: ") === true;
     return follow([tool("send_welcome_email"), ...(isRefused ? [] : [tool("reply_in_thread", { text: isSent ? "Review done: approved and welcomed." : "Review done: approved; the email may not have gone out." }), tool("finish_review")])], seen);
-  }
-  if (userText.startsWith("[dex-cloud")) {
-    // A status its own approve or reject explains is the model's own decision: it carries on.
-    const replies = userTexts.map((text) => /^\[slack [\d.]+\] <@\w+>: ([\s\S]*)$/.exec(text)?.[1]?.trim().toLowerCase() ?? "");
-    const isOwn = userText.startsWith("[dex-cloud active]") ? replies.includes("approve") : userText.startsWith("[dex-cloud rejected]") && replies.some((text) => text.startsWith("reject "));
-    if (isOwn) {
-      return { kind: "answer", text: "That is my own decision." };
-    }
-    return follow([tool("reply_in_thread", { text: "Decided in Dex Cloud admin; nothing more to do." }), tool("finish_review")], seen);
   }
   if (reply === "hold") {
     return { kind: "answer", text: "Holding." };

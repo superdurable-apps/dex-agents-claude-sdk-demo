@@ -1,14 +1,11 @@
-// What the tools and the poller share: the review's FlowIDs, its thread and latest draft as the poller Flow holds them,
-// and messages to the agent session.
+// What the tools, the watcher and the reply Trigger share: the review's FlowID, its thread and latest draft as the
+// session's own tool records hold them, and the index from a review thread to its session.
 
-import { setTimeout as sleep } from "node:timers/promises";
-
-import { FlowNotActiveOrNotFoundError, FlowNotFoundError, IdReusePolicy, InitialAttribute, StopType, type Client } from "@superdurable/dex";
+import { FlowNotActiveOrNotFoundError, FlowNotFoundError, StopType, type Client } from "@superdurable/dex";
 import {
   isFinalToolCallStatus,
   outcomeUnknownToolResult,
   readAgentSnapshot,
-  sendAgentUserMessage,
   type AgentFrameworkRunner,
   type AgentMessage,
   type AgentToolCallRecord,
@@ -17,40 +14,98 @@ import {
   type DeferredToolOutcome,
 } from "@superdurable/dex-agents";
 
-import { latestDraft, reviewThread, type Draft, type ReviewThread, type SignupReviewThreadPoller } from "./review-thread-poller.js";
-
 /** An agent session Flow of either harness. */
 export type ReviewSessionFlow = AgentSessionFlow<AgentFrameworkRunner<DeferredToolOutcome>>;
 
 export const reviewSessionId = (accountId: string): string => `signup-review-${accountId}`;
-export const reviewPollerId = (accountId: string): string => `signup-review-${accountId}-poller`;
 export const accountIdOf = (sessionId: string): string => sessionId.replace(/^signup-review-/, "");
 
 /** Prefix of the tools' own refusals: nothing was sent. */
 export const refusedPrefix = "refused: ";
 
-export interface ReviewerReply {
+/** The review's Slack thread in the review channel: the review post's timestamp. */
+export interface ReviewThread {
   readonly ts: string;
-  readonly userId: string;
-  readonly text: string;
 }
 
-/** What the poller holds for the tools: absent until post_review started it. */
+/** An email draft posted in the thread; the latest one is what send_welcome_email sends. */
+export interface Draft {
+  readonly number: number;
+  readonly subject: string;
+  readonly body: string;
+}
+
+/** What the session's own tool records say about its review post and drafts. */
 export interface ReviewRecord {
+  /** The thread of the succeeded post_review, or `undefined` before it. */
   readonly thread: ReviewThread | undefined;
+  /** The latest draft a succeeded post_review or post_draft posted, from a stored result or the running turn. */
   readonly latestDraft: Draft | undefined;
+  /** Whether a post_review may have posted the review: one did not definitely fail, or the history read is incomplete. */
+  readonly isReviewPosted: boolean;
+  readonly history: ToolHistory;
+}
+
+/** A JSON object, or `undefined`. */
+const objectOf = (text: string): Record<string, unknown> | undefined => {
+  try {
+    const value: unknown = JSON.parse(text);
+    return typeof value === "object" && value !== null && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
+  } catch {
+    return undefined;
+  }
+};
+const threadOf = (output: string): ReviewThread | undefined => {
+  const thread = objectOf(output)?.thread as { ts?: unknown } | undefined;
+  return typeof thread?.ts === "string" && /^\d+\.\d+$/.test(thread.ts) ? { ts: thread.ts } : undefined;
+};
+const draftOf = (output: string): Draft | undefined => {
+  const value = objectOf(output);
+  const draft = value?.draft as { number?: unknown } | undefined;
+  const email = value?.email as { subject?: unknown; body?: unknown } | undefined;
+  return typeof draft?.number === "number" && typeof email?.subject === "string" && typeof email.body === "string"
+    ? { number: draft.number, subject: email.subject, body: email.body }
+    : undefined;
+};
+
+/**
+ * The review's thread and latest draft from the session's tool records. A draft counts only from a structured record
+ * (a stored tool result or the running turn's call record), never from a turn note, whose free text could fake one.
+ * The thread may come from a turn note too, since a turn that fails after its post_review keeps that call only in the
+ * note; the tools post only in the configured review channel, so a thread read there can at worst name another
+ * thread of that channel.
+ */
+export function reviewRecordOf(history: ToolHistory): ReviewRecord {
+  const reviews = history.records.filter((record) => record.tool === "post_review");
+  const posted = reviews.filter((record) => record.outcome === "succeeded" && threadOf(record.output) !== undefined);
+  const thread = posted.find((record) => record.source !== "note") ?? posted.at(-1);
+  const drafts = history.records
+    .filter((record) => record.source !== "note" && (record.tool === "post_review" || record.tool === "post_draft") && record.outcome === "succeeded")
+    .map((record) => draftOf(record.output))
+    .filter((draft) => draft !== undefined);
+  return {
+    thread: thread === undefined ? undefined : threadOf(thread.output),
+    latestDraft: drafts.at(-1),
+    isReviewPosted: reviews.some((record) => record.outcome !== "failed") || (!history.isComplete && reviews.length === 0),
+    history,
+  };
 }
 
 const isMissing = (error: unknown) => error instanceof FlowNotFoundError || error instanceof FlowNotActiveOrNotFoundError;
 
-/** Reads and starts review pollers and sends sessions messages. Connect it once the Client and the Flows exist. */
+/**
+ * Reads review sessions and ends them, and maps a review thread to its session. Connect it once the Client and the
+ * session Flow exist.
+ */
 export class ReviewSessions {
-  private connected: { client: Client; sessionFlow: ReviewSessionFlow; pollerFlow: SignupReviewThreadPoller } | undefined;
+  private connected: { client: Client; sessionFlow: ReviewSessionFlow } | undefined;
+  /** Review thread timestamp to account, for this process. A review's thread never changes once posted. */
+  private readonly threads = new Map<string, string>();
+  private readonly indexedAccounts = new Set<string>();
+  private refresh: { readonly startedAt: number; readonly done: Promise<void> } | undefined;
 
-  public constructor(public readonly reviewerIds: ReadonlySet<string>) {}
-
-  public connect(client: Client, sessionFlow: ReviewSessionFlow, pollerFlow: SignupReviewThreadPoller): void {
-    this.connected = { client, sessionFlow, pollerFlow };
+  public connect(client: Client, sessionFlow: ReviewSessionFlow): void {
+    this.connected = { client, sessionFlow };
   }
 
   private get dex() {
@@ -60,51 +115,80 @@ export class ReviewSessions {
     return this.connected;
   }
 
-  /** The review's thread and latest draft from its poller; empty when no review post succeeded yet. */
-  public async read(accountId: string): Promise<ReviewRecord> {
-    try {
-      const [thread, draft] = await this.dex.client.getAttributes(reviewPollerId(accountId), reviewThread, latestDraft);
-      return { thread, latestDraft: draft };
-    } catch (error: unknown) {
-      if (isMissing(error)) {
-        return { thread: undefined, latestDraft: undefined };
-      }
-      throw error;
-    }
+  /** The review's thread and latest draft, from one read of the session's tool records. */
+  public async review(accountId: string): Promise<ReviewRecord> {
+    return reviewRecordOf(await this.toolRecords(accountId));
+  }
+
+  /** Records which review a thread belongs to; post_review calls it once its post went out. */
+  public rememberThread(threadTs: string, accountId: string): void {
+    this.threads.set(threadTs, accountId);
+    this.indexedAccounts.add(accountId);
   }
 
   /**
-   * Starts the review's poller with its thread and draft 1, after the review post went out. The Request ID comes from
-   * the account, so a repeated start joins the same run; a passing Dex failure is tried again a few times, since a
-   * posted review without a poller hears no reviewer.
+   * The account whose review thread `threadTs` is, or `undefined` when no running review posted it. A thread this
+   * process does not know yet is looked up in Dex: the running sessions of the session Flow type and their own
+   * records, read by a lookup that started at or after `since`, so it cannot miss a review posted before then. The
+   * index is only this process's cache: a restart, or another process such as the hosted web process, rebuilds it
+   * the same way. A failed lookup rejects, and the caller tries again later.
    */
-  public async startPoller(accountId: string, thread: ReviewThread, draft: Draft): Promise<void> {
-    for (let attempt = 1; ; attempt++) {
-      try {
-        await this.dex.client.startFlow(this.dex.pollerFlow, reviewPollerId(accountId), { accountId }, {
-          requestId: `${accountId}-poller`,
-          ignoreAlreadyStarted: true,
-          idReusePolicy: IdReusePolicy.DISALLOW,
-          attributes: [InitialAttribute.of(reviewThread, thread), InitialAttribute.of(latestDraft, draft)],
-        });
-        return;
-      } catch (error: unknown) {
-        if (attempt >= 4) {
-          throw error;
-        }
-        await sleep(250 * 2 ** attempt);
+  public async accountOfThread(threadTs: string, since: number): Promise<string | undefined> {
+    const known = this.threads.get(threadTs);
+    if (known !== undefined) {
+      return known;
+    }
+    await this.refreshAfter(since);
+    return this.threads.get(threadTs);
+  }
+
+  /** Waits for a lookup of the running reviews that started at or after `since`; concurrent callers share one. */
+  private async refreshAfter(since: number): Promise<void> {
+    for (;;) {
+      const current = this.refresh;
+      if (current !== undefined && current.startedAt >= since) {
+        return current.done;
       }
+      if (current !== undefined) {
+        await current.done.catch(() => undefined);
+        continue;
+      }
+      const refresh = { startedAt: Date.now(), done: this.indexRunningReviews() };
+      this.refresh = refresh;
+      void refresh.done
+        .catch(() => undefined)
+        .finally(() => {
+          if (this.refresh === refresh) {
+            this.refresh = undefined;
+          }
+        });
+      return refresh.done;
     }
   }
 
-  /** Records the draft post_draft posted as the latest one. */
-  public async recordDraft(accountId: string, draft: Draft): Promise<void> {
-    await this.dex.client.invokeRPC(this.dex.pollerFlow.recordDraft, reviewPollerId(accountId), draft);
+  /** Reads the thread of each running review not indexed yet. */
+  private async indexRunningReviews(): Promise<void> {
+    const { client, sessionFlow } = this.dex;
+    const query = `FlowType = "${sessionFlow.getFlowType()}" AND ExecutionStatus = "Running"`;
+    let pageToken = "";
+    do {
+      const page = await client.searchFlows(query, 100, pageToken);
+      for (const entry of page.flows) {
+        const accountId = accountIdOf(entry.flowId);
+        if (entry.flowId === reviewSessionId(accountId) && !this.indexedAccounts.has(accountId)) {
+          const { thread } = await this.review(accountId);
+          if (thread !== undefined) {
+            this.rememberThread(thread.ts, accountId);
+          }
+        }
+      }
+      pageToken = page.nextPageToken;
+    } while (pageToken !== "");
   }
 
   /**
-   * Ends the review: cancels its session, which never ends on its own; the poller sees that and completes. finish_review
-   * calls it as its last act, so cancelling the session's own running tool Step loses nothing.
+   * Ends the review: cancels its session, which never ends on its own. finish_review calls it as its last act, so
+   * cancelling the session's own running tool Step loses nothing.
    */
   public async endSession(accountId: string, reason: string): Promise<void> {
     await this.dex.client.stopFlow(reviewSessionId(accountId), { type: StopType.CANCEL, reason }).catch((error: unknown) => {
@@ -146,91 +230,7 @@ export class ReviewSessions {
     const { snapshot, messages, isComplete } = await this.history(accountId);
     return { records: toolRecordsOf(messages, snapshot.toolCalls), isComplete };
   }
-
-  /**
-   * Sends `[retry turn-<n>]` for `turnId` if, read again now, the session's latest turn is still that failed turn and
-   * its retry is due. The check and the send are not atomic; sendOnce's marker check narrows the rest.
-   * @returns Whether it sent the retry.
-   */
-  public async retryFailedTurn(accountId: string, turnId: string, firstDelayMs?: number): Promise<boolean> {
-    const failed = failedTurnOf(await this.snapshot(accountId), firstDelayMs);
-    if (failed?.turnId !== turnId || Date.now() < failed.dueAt) {
-      return false;
-    }
-    await this.sendOnce(accountId, failed.marker, failed.text);
-    return true;
-  }
-
-  /** Sends `<marker> <text>` unless the session already holds or queues a message that starts with `marker`. */
-  public async sendOnce(accountId: string, marker: string, text: string): Promise<void> {
-    const { client, sessionFlow } = this.dex;
-    const sessionId = reviewSessionId(accountId);
-    const { snapshot, messages } = await this.history(accountId);
-    const isThere =
-      messages.some((message) => message.role === "user" && (message.text ?? "").startsWith(marker)) ||
-      (snapshot.queuedMessages ?? []).some((pending) => pending.message.text.startsWith(marker));
-    if (!isThere) {
-      await sendAgentUserMessage(client, sessionFlow, sessionId, { text: `${marker} ${text}` });
-    }
-  }
 }
-
-/** The first retry of a failed turn waits this long; each later one twice as long, up to {@link maxRetryDelayMs}. */
-export const firstRetryDelayMs = 2 * 60_000;
-export const maxRetryDelayMs = 30 * 60_000;
-/** Starts every retry message: `[retry turn-<n>]`, with the failed turn's ID. */
-export const retryMarkerPrefix = "[retry ";
-
-/** A failed turn of an idle session, and when and how to retry it. */
-export interface FailedTurn {
-  /** The failed turn, `turn-<n>`. */
-  readonly turnId: string;
-  /** Its error, short and on one line. */
-  readonly error: string;
-  /** Retries already sent since the message whose turn first failed: 0 for a fresh failure. */
-  readonly retries: number;
-  /** When the next retry is due, in epoch milliseconds. */
-  readonly dueAt: number;
-  /** The retry message's marker, unique per failed turn, and the text after it. */
-  readonly marker: string;
-  readonly text: string;
-}
-
-/**
- * The latest turn of an idle session if it failed, or `undefined`. A turn that ends well clears `lastTurnError`, and
- * a queued message starts a turn anyway, so neither counts. The back-off keeps no state of its own: the retries are
- * the retry messages after the message whose turn first failed, and the wait counts from the newest stored message.
- */
-export function failedTurnOf(snapshot: AgentSnapshot, firstDelayMs = firstRetryDelayMs): FailedTurn | undefined {
-  const state = snapshot.state;
-  if (state?.status !== "waiting_for_user_message" || !state.lastTurnError || snapshot.queuedMessageCount > 0 || state.turnCount < 1) {
-    return undefined;
-  }
-  const users = snapshot.messages.filter((message) => message.role === "user" && message.origin === undefined);
-  const isRetry = (message: AgentMessage) => (message.text ?? "").startsWith(retryMarkerPrefix);
-  const original = [...users].reverse().find((message) => !isRetry(message));
-  const retries = users.filter((message) => isRetry(message) && message.sequence > (original?.sequence ?? 0)).length;
-  // Once the original has left the snapshot's window, the latest retry still quotes it.
-  const latestRetry = [...users].reverse().find(isRetry);
-  const originalText = original?.text ?? quotedByRetry(latestRetry?.text ?? "");
-  const newest = snapshot.messages.at(-1);
-  const since = newest === undefined ? Date.now() : Date.parse(newest.createdAt);
-  const turnId = `turn-${state.turnCount}`;
-  const error = state.lastTurnError.replace(/\s+/g, " ").trim().slice(0, 200);
-  // The failed turn's message is quoted, since a harness may not have kept a turn that failed.
-  const quoted = originalText.slice(0, 4_000);
-  return {
-    turnId,
-    error,
-    retries,
-    dueAt: since + Math.min(firstDelayMs * 2 ** retries, maxRetryDelayMs),
-    marker: `${retryMarkerPrefix}${turnId}]`,
-    text: `The previous turn failed (${error}). Handle this message again as new, then continue the review from where you left off:\n${quoted}`,
-  };
-}
-
-/** The message a retry message quotes: everything after its first line. */
-export const quotedByRetry = (text: string): string => (text.includes("\n") ? text.slice(text.indexOf("\n") + 1) : "");
 
 /** One tool call as the session itself recorded it, in the order the session stored it. */
 export interface ToolRecord {
@@ -408,14 +408,15 @@ export function toolRecordsOf(messages: readonly AgentMessage[], activeToolCalls
       records.push({ tool, outcome: outcomeOfResult(tool, output), output, position: message.sequence, source: "result" });
     } else if (message.role === "user" && message.origin !== undefined && noteOrigins.has(message.origin)) {
       const text = message.text ?? "";
-      // From a note: evidence of a send, and a decision's success, which a decision tool checks against the account
-      // before it relies on it. Never a draft post: a note's free text could fake one after a real send.
+      // From a note: evidence of a send, a decision's success, which a decision tool checks against the account
+      // before it relies on it, and a review post, for its thread only. Never a draft post: a note's free text could
+      // fake one after a real send.
       for (const outcome of noteSendEvidence(text)) {
         records.push({ tool: sendTool, outcome, output: "", position: message.sequence, source: "note" });
       }
       for (const entry of noteEntries(text)) {
-        if ((entry.tool === "approve_account" || entry.tool === "reject_account") && entry.status !== undefined) {
-          records.push({ tool: entry.tool, outcome: outcomeOfStatus(entry.status), output: entry.output, position: message.sequence, source: "note" });
+        if ((entry.tool === "approve_account" || entry.tool === "reject_account" || entry.tool === "post_review") && entry.status !== undefined) {
+          records.push({ tool: entry.tool, outcome: outcomeOfStatus(entry.status), output: entry.output.trim(), position: message.sequence, source: "note" });
         }
       }
     }
@@ -470,12 +471,3 @@ export function earlierDecision(decision: "approve" | "reject", accountStatus: s
 /** The output of the session's latest succeeded call of `tool`, or `undefined`. */
 export const succeededOutput = (records: readonly ToolRecord[], tool: string): string | undefined =>
   records.filter((record) => record.tool === tool && record.outcome === "succeeded").at(-1)?.output;
-
-/** Whether Slack timestamp `ts` is later than `other`, compared exactly (`<seconds>.<microseconds>`). */
-export function isLater(ts: string, other: string): boolean {
-  const exact = (value: string): bigint => {
-    const [seconds = "0", fraction = ""] = value.split(".");
-    return BigInt(seconds) * 1_000_000n + BigInt((fraction + "000000").slice(0, 6));
-  };
-  return exact(ts) > exact(other);
-}
