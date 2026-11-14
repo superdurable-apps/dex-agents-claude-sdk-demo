@@ -1,114 +1,56 @@
-// SignupWatcher: a polling loop in the Worker process (not a Flow) that starts each pending sign-up's review.
+// SignupWatcher: a polling loop in the Worker process (not a Flow) that starts each pending sign-up's review session,
+// and retries a failed turn of one that has no thread poller yet. The session's post_review starts the poller.
 
 import { setTimeout as sleep } from "node:timers/promises";
 
-import { FlowNotActiveOrNotFoundError, FlowNotFoundError, IdReusePolicy, InitialAttribute, StopType, stringCodec, type Client, type FlowInfo } from "@superdurable/dex";
+import { FlowNotActiveOrNotFoundError, FlowNotFoundError, IdReusePolicy, type Client } from "@superdurable/dex";
 import { startAgentSession } from "@superdurable/dex-agents";
 
 import type { Account, ReviewApiClient } from "./review-api.js";
-import { accountIdOf, effects, ledgerRestarts, relayedReplies, reviewLedgerId, reviewSessionId, threadCursor, threadPage, type ReviewSessionFlow } from "./review-state.js";
-import { noSessionStarted, type SignupReviewLedgerFlow } from "./review-ledger-flow.js";
+import { failedTurnOf, reviewPollerId, reviewSessionId, type ReviewSessionFlow, type ReviewSessions } from "./review-state.js";
 import { firstReviewMessage } from "./signup-agent.js";
-
-/** A ledger that keeps ending (such as a Slack app without access) is not started again after this many runs. */
-const maxLedgerRestarts = 3;
 
 export interface SignupWatcherParts {
   readonly client: Client;
   readonly sessionFlow: ReviewSessionFlow;
-  readonly ledgerFlow: SignupReviewLedgerFlow;
+  readonly sessions: ReviewSessions;
   readonly reviewApi: ReviewApiClient;
   /** Only sign-ups registered at or after this time are reviewed: the backlog before the demo is left alone. */
   readonly reviewSince: Date;
-}
-
-async function describeOrUndefined(client: Client, flowId: string): Promise<FlowInfo | undefined> {
-  try {
-    return await client.describeFlow(flowId);
-  } catch (error: unknown) {
-    if (error instanceof FlowNotFoundError || error instanceof FlowNotActiveOrNotFoundError) {
-      return undefined;
-    }
-    throw error;
-  }
+  /** The wait before the first retry of a failed turn; 2 minutes by default. */
+  readonly firstRetryDelayMs?: number;
 }
 
 /**
- * Keeps a review's ledger alive while its session runs. A ledger that ended is started again, at most
- * `maxLedgerRestarts` times, under a Request ID named after the ended run, with that run's effects, replies and
- * cursors as its initial Attributes. When the cap is reached, or the ledger ended before its session existed, the
- * session is cancelled, so no review runs without a ledger.
- */
-async function reviveLedger(parts: SignupWatcherParts, accountId: string, ledger: FlowInfo): Promise<void> {
-  const { client } = parts;
-  const ledgerId = reviewLedgerId(accountId);
-  const [recorded, replies, cursor, page, restarts] = await client.getAttributes(ledgerId, effects, relayedReplies, threadCursor, threadPage, ledgerRestarts);
-  const result = ledger.status === "completed" ? await client.waitForFlow(ledgerId, 5_000) : undefined;
-  const endedBeforeSession = (() => {
-    try {
-      return result?.singleOutput(stringCodec) === noSessionStarted;
-    } catch {
-      return false;
-    }
-  })();
-  if (endedBeforeSession || (restarts ?? 0) >= maxLedgerRestarts) {
-    console.warn(`signup watcher: the ledger of ${accountId} cannot run again; its session is cancelled`);
-    await client.stopFlow(reviewSessionId(accountId), { type: StopType.CANCEL, reason: "the review ledger ended" });
-    return;
-  }
-  await client.startFlow(parts.ledgerFlow, ledgerId, { accountId, isRestart: true }, {
-    requestId: `${accountId}-ledger-after-${ledger.runId}`,
-    ignoreAlreadyStarted: true,
-    idReusePolicy: IdReusePolicy.ALLOW_IF_NOT_RUNNING,
-    attributes: [
-      InitialAttribute.of(effects, recorded ?? []),
-      InitialAttribute.of(relayedReplies, replies ?? []),
-      InitialAttribute.of(ledgerRestarts, (restarts ?? 0) + 1),
-      ...(cursor === undefined ? [] : [InitialAttribute.of(threadCursor, cursor)]),
-      ...(page === undefined ? [] : [InitialAttribute.of(threadPage, page)]),
-    ],
-  });
-}
-
-/**
- * Starts one pending review: its ledger first, since no write tool dispatches without one, then its session. FlowIDs
- * and Request IDs come from the account, and the session's ID is never reused, so starting again joins the same runs.
+ * Starts one pending review's session. Its FlowID and Request ID come from the account, and the ID is never reused.
+ * A session whose latest turn failed before its review post, so that no poller watches it yet, is retried here.
  */
 async function startReview(parts: SignupWatcherParts, account: Account): Promise<void> {
-  const { client } = parts;
   const { accountId } = account;
-  const ledgerId = reviewLedgerId(accountId);
-  const [ledger, session] = await Promise.all([describeOrUndefined(client, ledgerId), describeOrUndefined(client, reviewSessionId(accountId))]);
-  if (ledger === undefined) {
-    await client.startFlow(parts.ledgerFlow, ledgerId, { accountId }, { requestId: `${accountId}-ledger`, ignoreAlreadyStarted: true, idReusePolicy: IdReusePolicy.ALLOW_IF_NOT_RUNNING });
-  } else if (ledger.status !== "running" && session?.status === "running") {
-    await reviveLedger(parts, accountId, ledger);
+  await startAgentSession(parts.client, parts.sessionFlow, reviewSessionId(accountId), { initialMessage: firstReviewMessage(account) }, {
+    requestId: accountId,
+    ignoreAlreadyStarted: true,
+    idReusePolicy: IdReusePolicy.DISALLOW,
+  });
+  const failed = failedTurnOf(await parts.sessions.snapshot(accountId), parts.firstRetryDelayMs);
+  if (failed === undefined || (await isRunning(parts.client, reviewPollerId(accountId)))) {
+    return;
   }
-  if (session === undefined) {
-    await startAgentSession(client, parts.sessionFlow, reviewSessionId(accountId), { initialMessage: firstReviewMessage(account) }, {
-      requestId: accountId,
-      ignoreAlreadyStarted: true,
-      idReusePolicy: IdReusePolicy.DISALLOW,
-    });
+  if (Date.now() >= failed.dueAt) {
+    // No thread to post in yet, and connector calls run only in a Dex Step: the log is the only notice.
+    console.warn(`signup watcher: ${accountId}: the agent's ${failed.turnId} failed (${failed.error}); retry ${failed.retries + 1}`);
+    await parts.sessions.sendOnce(accountId, failed.marker, failed.text);
   }
 }
 
-/** Revives the ledgers of running sessions, such as reviews whose account is no longer pending; at most 500 per round. */
-async function reviveRunningReviews(parts: SignupWatcherParts): Promise<void> {
-  let pageToken = "";
-  for (let page = 0; page < 5; page++) {
-    const sessions = await parts.client.searchFlows(`FlowType = "${parts.sessionFlow.getFlowType()}" AND ExecutionStatus = "Running"`, 100, pageToken);
-    for (const session of sessions.flows) {
-      const accountId = accountIdOf(session.flowId);
-      const ledger = await describeOrUndefined(parts.client, reviewLedgerId(accountId));
-      if (ledger !== undefined && ledger.status !== "running") {
-        await reviveLedger(parts, accountId, ledger).catch((error: unknown) => console.warn(`signup watcher: ${accountId}: ${error instanceof Error ? error.message : String(error)}`));
-      }
+async function isRunning(client: Client, flowId: string): Promise<boolean> {
+  try {
+    return (await client.describeFlow(flowId)).status === "running";
+  } catch (error: unknown) {
+    if (error instanceof FlowNotFoundError || error instanceof FlowNotActiveOrNotFoundError) {
+      return false;
     }
-    pageToken = sessions.nextPageToken;
-    if (pageToken === "") {
-      break;
-    }
+    throw error;
   }
 }
 
@@ -136,7 +78,6 @@ export async function startPendingReviews(parts: SignupWatcherParts): Promise<st
       break;
     }
   }
-  await reviveRunningReviews(parts).catch((error: unknown) => console.warn(`signup watcher: ${error instanceof Error ? error.message : String(error)}`));
   return failed;
 }
 

@@ -1,10 +1,9 @@
-// The facts of a review, from its ledger: the per-account Dex Flow that records every external effect and every relayed
-// reviewer reply. Guards decide only from the ledger and the ReviewAPI, never from the session's message history, which
-// the model's output and tool results can shape.
+// What the tools and the poller share: the review's FlowIDs, its thread and latest draft as the poller Flow holds them,
+// and messages to the agent session.
 
 import { setTimeout as sleep } from "node:timers/promises";
 
-import { Attribute, FlowNotActiveOrNotFoundError, FlowNotFoundError, RpcLockConflictError, doubleCodec, jsonCodec, stringCodec, type Client } from "@superdurable/dex";
+import { FlowNotActiveOrNotFoundError, FlowNotFoundError, IdReusePolicy, InitialAttribute, StopType, type Client } from "@superdurable/dex";
 import {
   readAgentSnapshot,
   sendAgentUserMessage,
@@ -15,18 +14,17 @@ import {
   type DeferredToolOutcome,
 } from "@superdurable/dex-agents";
 
-import type { SignupReviewLedgerFlow } from "./review-ledger-flow.js";
+import { latestDraft, reviewThread, type Draft, type ReviewThread, type SignupReviewThreadPoller } from "./review-thread-poller.js";
 
 /** An agent session Flow of either harness. */
 export type ReviewSessionFlow = AgentSessionFlow<AgentFrameworkRunner<DeferredToolOutcome>>;
 
 export const reviewSessionId = (accountId: string): string => `signup-review-${accountId}`;
-export const reviewLedgerId = (accountId: string): string => `signup-review-${accountId}-ledger`;
+export const reviewPollerId = (accountId: string): string => `signup-review-${accountId}-poller`;
 export const accountIdOf = (sessionId: string): string => sessionId.replace(/^signup-review-/, "");
 
-/** Prefixes of the tools' own failures that prove nothing was sent. */
+/** Prefix of the tools' own refusals: nothing was sent. */
 export const refusedPrefix = "refused: ";
-export const notSentPrefix = "not sent: ";
 
 export interface ReviewerReply {
   readonly ts: string;
@@ -34,115 +32,22 @@ export interface ReviewerReply {
   readonly text: string;
 }
 
-/**
- * One external effect of the review. A write tool records `attempted` before it dispatches and `succeeded` or
- * `not_sent` (only with proof that nothing went out) after; an `attempted` effect without either may have happened.
- */
-export interface Effect {
-  /** The Dex per-call identity: the same on every attempt of one tool call. */
-  readonly callKey: string;
-  readonly tool: string;
-  readonly status: "attempted" | "succeeded" | "not_sent";
-  /** What it did, kept small: the Slack message's channel, timestamp and user, the draft, the decision. */
-  readonly result?: Record<string, unknown> | undefined;
-  readonly at: string;
+/** What the poller holds for the tools: absent until post_review started it. */
+export interface ReviewRecord {
+  readonly thread: ReviewThread | undefined;
+  readonly latestDraft: Draft | undefined;
 }
 
-/** Ledger state: every reviewer reply it relayed, oldest first, recorded before it is forwarded. */
-export const relayedReplies = new Attribute<ReviewerReply[]>("RelayedReplies", jsonCodec({ typeName: "ReviewerReplies" }));
-/** Ledger state: the timestamp of the last relayed reply. */
-export const threadCursor = new Attribute("Cursor", stringCodec);
-/** Ledger state: every effect, in the order of their first record. */
-export const effects = new Attribute<Effect[]>("Effects", jsonCodec({ typeName: "Effects" }));
-/** Ledger state: the Slack page cursor of the newest thread page read; each round reads that one page. */
-export const threadPage = new Attribute("ThreadPage", stringCodec);
-/** Ledger state: how many ledger runs came before this one for the same review. */
-export const ledgerRestarts = new Attribute("Restarts", doubleCodec);
+const isMissing = (error: unknown) => error instanceof FlowNotFoundError || error instanceof FlowNotActiveOrNotFoundError;
 
-export interface Draft {
-  readonly number: number;
-  readonly subject: string;
-  readonly body: string;
-  readonly ts: string;
-}
-
-/** The facts of one review, as the ledger has them. */
-export interface ReviewState {
-  readonly effects: readonly Effect[];
-  /** The review's Slack thread, once a review post succeeded, and the bot user that posted it. */
-  readonly thread?: { readonly channel: string; readonly ts: string; readonly botUserId: string | undefined };
-  /** The newest draft whose post succeeded. */
-  readonly latestDraft?: Draft;
-  /** Drafts whose post may have gone out, the review post included. */
-  readonly draftAttempts: number;
-  /** Whether a draft post newer than the latest draft may have gone out without a confirmation. */
-  readonly hasUnconfirmedNewerDraft: boolean;
-  /** When a review post that may have gone out without a confirmation was attempted. */
-  readonly unconfirmedReviewPostAt?: string;
-  readonly replies: readonly ReviewerReply[];
-  /** The latest reply that decides: exactly `approve`, `reject <reason>`, or `hold`, which cancels both. */
-  readonly decision?: "approve" | "reject";
-  readonly isApprovedHere: boolean;
-  readonly isRejectedHere: boolean;
-  /** Whether a send may have gone out. */
-  readonly hasSendAttempt: boolean;
-  readonly isFinished: boolean;
-}
-
-/** The facts from the ledger's effects and replies. */
-export function factsOf(recorded: readonly Effect[], allReplies: readonly ReviewerReply[], reviewerIds: ReadonlySet<string>): ReviewState {
-  const mayHaveHappened = (effect: Effect) => effect.status === "attempted" || effect.status === "succeeded";
-  const reviewPost = recorded.find((effect) => effect.tool === "post_review" && effect.status === "succeeded");
-  const reviewMessage = reviewPost?.result?.message as { channelId?: string; timestamp?: string; userId?: string } | undefined;
-  let latestDraft: Draft | undefined;
-  let hasUnconfirmedNewerDraft = false;
-  for (const effect of recorded.filter((candidate) => candidate.tool === "post_review" || candidate.tool === "post_draft")) {
-    if (effect.status === "succeeded") {
-      const draft = effect.result?.draft as Omit<Draft, "ts"> | null | undefined;
-      const ts = String((effect.result?.message as { timestamp?: string } | undefined)?.timestamp ?? "");
-      latestDraft = draft ? { ...draft, ts } : effect.tool === "post_review" ? undefined : latestDraft;
-      hasUnconfirmedNewerDraft = false;
-    } else if (effect.status === "attempted" && effect.tool === "post_draft") {
-      hasUnconfirmedNewerDraft = true;
-    }
-  }
-  const replies = allReplies.filter((reply) => reviewerIds.has(reply.userId) && reply.userId !== reviewMessage?.userId);
-  let decision: "approve" | "reject" | undefined;
-  for (const reply of replies) {
-    decision = /^approve$/i.test(reply.text) ? "approve" : /^reject\s+\S/i.test(reply.text) ? "reject" : /^hold$/i.test(reply.text) ? undefined : decision;
-  }
-  const unconfirmedReviewPost = reviewPost === undefined ? recorded.find((effect) => effect.tool === "post_review" && effect.status === "attempted") : undefined;
-  const decided = (tool: string, status: string) => recorded.some((effect) => effect.tool === tool && effect.status === "succeeded" && effect.result?.status === status);
-  return {
-    effects: recorded,
-    ...(reviewMessage?.timestamp ? { thread: { channel: String(reviewMessage.channelId), ts: reviewMessage.timestamp, botUserId: reviewMessage.userId } } : {}),
-    ...(latestDraft === undefined ? {} : { latestDraft }),
-    // The review post is draft 1 however many calls it took; each post_draft that may have gone out is the next.
-    draftAttempts:
-      (recorded.some((effect) => effect.tool === "post_review" && mayHaveHappened(effect)) ? 1 : 0) +
-      recorded.filter((effect) => effect.tool === "post_draft" && mayHaveHappened(effect)).length,
-    hasUnconfirmedNewerDraft,
-    ...(unconfirmedReviewPost === undefined ? {} : { unconfirmedReviewPostAt: unconfirmedReviewPost.at }),
-    replies,
-    ...(decision === undefined ? {} : { decision }),
-    isApprovedHere: decided("approve_account", "approved"),
-    isRejectedHere: decided("reject_account", "rejected"),
-    hasSendAttempt: recorded.some((effect) => effect.tool === "send_welcome_email" && mayHaveHappened(effect)),
-    isFinished: recorded.some((effect) => effect.tool === "finish_review" && effect.status === "succeeded"),
-  };
-}
-
-/** A ledger that does not exist: the guards refuse, since nothing could be recorded. */
-export class MissingLedgerError extends Error {}
-
-/** Reads review ledgers, records effects, and sends sessions messages. Connect it once the Client and the Flows exist. */
+/** Reads and starts review pollers and sends sessions messages. Connect it once the Client and the Flows exist. */
 export class ReviewSessions {
-  private connected: { client: Client; sessionFlow: ReviewSessionFlow; ledgerFlow: SignupReviewLedgerFlow } | undefined;
+  private connected: { client: Client; sessionFlow: ReviewSessionFlow; pollerFlow: SignupReviewThreadPoller } | undefined;
 
   public constructor(public readonly reviewerIds: ReadonlySet<string>) {}
 
-  public connect(client: Client, sessionFlow: ReviewSessionFlow, ledgerFlow: SignupReviewLedgerFlow): void {
-    this.connected = { client, sessionFlow, ledgerFlow };
+  public connect(client: Client, sessionFlow: ReviewSessionFlow, pollerFlow: SignupReviewThreadPoller): void {
+    this.connected = { client, sessionFlow, pollerFlow };
   }
 
   private get dex() {
@@ -152,22 +57,58 @@ export class ReviewSessions {
     return this.connected;
   }
 
-  /** The review's facts from its ledger. */
-  public async read(accountId: string): Promise<ReviewState> {
+  /** The review's thread and latest draft from its poller; empty when no review post succeeded yet. */
+  public async read(accountId: string): Promise<ReviewRecord> {
     try {
-      const [recorded, replies] = await this.dex.client.getAttributes(reviewLedgerId(accountId), effects, relayedReplies);
-      return factsOf(recorded ?? [], replies ?? [], this.reviewerIds);
+      const [thread, draft] = await this.dex.client.getAttributes(reviewPollerId(accountId), reviewThread, latestDraft);
+      return { thread, latestDraft: draft };
     } catch (error: unknown) {
-      if (error instanceof FlowNotFoundError || error instanceof FlowNotActiveOrNotFoundError) {
-        throw new MissingLedgerError(`the review ledger ${reviewLedgerId(accountId)} does not exist`);
+      if (isMissing(error)) {
+        return { thread: undefined, latestDraft: undefined };
       }
       throw error;
     }
   }
 
-  /** Records an effect in the review's ledger; a failure means nothing may be dispatched. */
-  public async record(accountId: string, effect: Omit<Effect, "at">): Promise<void> {
-    await retryOnLockConflict(() => this.dex.client.invokeRPC(this.dex.ledgerFlow.recordEffect, reviewLedgerId(accountId), effect));
+  /**
+   * Starts the review's poller with its thread and draft 1, after the review post went out. The Request ID comes from
+   * the account, so a repeated start joins the same run; a passing Dex failure is tried again a few times, since a
+   * posted review without a poller hears no reviewer.
+   */
+  public async startPoller(accountId: string, thread: ReviewThread, draft: Draft): Promise<void> {
+    for (let attempt = 1; ; attempt++) {
+      try {
+        await this.dex.client.startFlow(this.dex.pollerFlow, reviewPollerId(accountId), { accountId }, {
+          requestId: `${accountId}-poller`,
+          ignoreAlreadyStarted: true,
+          idReusePolicy: IdReusePolicy.DISALLOW,
+          attributes: [InitialAttribute.of(reviewThread, thread), InitialAttribute.of(latestDraft, draft)],
+        });
+        return;
+      } catch (error: unknown) {
+        if (attempt >= 4) {
+          throw error;
+        }
+        await sleep(250 * 2 ** attempt);
+      }
+    }
+  }
+
+  /** Records the draft post_draft posted as the latest one. */
+  public async recordDraft(accountId: string, draft: Draft): Promise<void> {
+    await this.dex.client.invokeRPC(this.dex.pollerFlow.recordDraft, reviewPollerId(accountId), draft);
+  }
+
+  /**
+   * Ends the review: cancels its session, which never ends on its own; the poller sees that and completes. finish_review
+   * calls it as its last act, so cancelling the session's own running tool Step loses nothing.
+   */
+  public async endSession(accountId: string, reason: string): Promise<void> {
+    await this.dex.client.stopFlow(reviewSessionId(accountId), { type: StopType.CANCEL, reason }).catch((error: unknown) => {
+      if (!isMissing(error)) {
+        throw error;
+      }
+    });
   }
 
   public snapshot(accountId: string): Promise<AgentSnapshot> {
@@ -196,18 +137,55 @@ export class ReviewSessions {
   }
 }
 
-/** Runs `work`, retrying up to 4 times with a growing pause when another RPC holds the ledger's lock. */
-export async function retryOnLockConflict<T>(work: () => Promise<T>): Promise<T> {
-  for (let attempt = 1; ; attempt++) {
-    try {
-      return await work();
-    } catch (error: unknown) {
-      if (!(error instanceof RpcLockConflictError) || attempt >= 4) {
-        throw error;
-      }
-      await sleep(100 * 2 ** attempt);
-    }
+/** The first retry of a failed turn waits this long; each later one twice as long, up to {@link maxRetryDelayMs}. */
+export const firstRetryDelayMs = 2 * 60_000;
+export const maxRetryDelayMs = 30 * 60_000;
+/** Starts every retry message: `[retry turn-<n>]`, with the failed turn's ID. */
+export const retryMarkerPrefix = "[retry ";
+
+/** A failed turn of an idle session, and when and how to retry it. */
+export interface FailedTurn {
+  /** The failed turn, `turn-<n>`. */
+  readonly turnId: string;
+  /** Its error, short and on one line. */
+  readonly error: string;
+  /** Retries already sent since the message whose turn first failed: 0 for a fresh failure. */
+  readonly retries: number;
+  /** When the next retry is due, in epoch milliseconds. */
+  readonly dueAt: number;
+  /** The retry message's marker, unique per failed turn, and the text after it. */
+  readonly marker: string;
+  readonly text: string;
+}
+
+/**
+ * The latest turn of an idle session if it failed, or `undefined`. A turn that ends well clears `lastTurnError`, and
+ * a queued message starts a turn anyway, so neither counts. The back-off keeps no state of its own: the retries are
+ * the retry messages after the message whose turn first failed, and the wait counts from the newest stored message.
+ */
+export function failedTurnOf(snapshot: AgentSnapshot, firstDelayMs = firstRetryDelayMs): FailedTurn | undefined {
+  const state = snapshot.state;
+  if (state?.status !== "waiting_for_user_message" || !state.lastTurnError || snapshot.queuedMessageCount > 0 || state.turnCount < 1) {
+    return undefined;
   }
+  const users = snapshot.messages.filter((message) => message.role === "user" && message.origin === undefined);
+  const isRetry = (message: AgentMessage) => (message.text ?? "").startsWith(retryMarkerPrefix);
+  const original = [...users].reverse().find((message) => !isRetry(message));
+  const retries = users.filter((message) => isRetry(message) && message.sequence > (original?.sequence ?? 0)).length;
+  const newest = snapshot.messages.at(-1);
+  const since = newest === undefined ? Date.now() : Date.parse(newest.createdAt);
+  const turnId = `turn-${state.turnCount}`;
+  const error = state.lastTurnError.replace(/\s+/g, " ").trim().slice(0, 200);
+  // The failed turn's message is quoted, since a harness may not have kept a turn that failed.
+  const quoted = (original?.text ?? "").slice(0, 4_000);
+  return {
+    turnId,
+    error,
+    retries,
+    dueAt: since + Math.min(firstDelayMs * 2 ** retries, maxRetryDelayMs),
+    marker: `${retryMarkerPrefix}${turnId}]`,
+    text: `The previous turn failed (${error}). Handle this message again as new, then continue the review from where you left off:\n${quoted}`,
+  };
 }
 
 /** Whether Slack timestamp `ts` is later than `other`, compared exactly (`<seconds>.<microseconds>`). */

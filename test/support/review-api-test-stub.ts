@@ -32,6 +32,8 @@ export class ReviewApiTestStub {
   private readonly accounts = new Map<string, StoredAccount>();
   /** Operations whose next call is applied but answered with a 503, as a lost response would look. */
   private readonly failAfterApplying = new Set<string>();
+  /** Operations whose next call is refused with `failed_precondition` and not applied. */
+  private readonly refuseNextCall = new Set<string>();
   /** As the server does until it can leave the platform's approval mail out: refuse `suppressApprovedMail: true`. */
   public refusesSuppressedMail = false;
   /** Gets answered with a 503 before the next one succeeds. */
@@ -75,8 +77,17 @@ export class ReviewApiTestStub {
   }
 
   /** Applies the next `operation` call, then answers 503 instead of the result. */
-  public failNextResponse(operation: "approve" | "reject"): void {
+  public failNextResponse(operation: "approve" | "reject", thenFailingGets = 0): void {
     this.failAfterApplying.add(operation);
+    this.getsFailingAfterLostAnswer = thenFailingGets;
+  }
+
+  /** Gets answered with a 503 once a lost answer was sent, as a ReviewAPI that stays busy. */
+  private getsFailingAfterLostAnswer = 0;
+
+  /** Refuses the next `operation` call with `failed_precondition`, applying nothing. */
+  public refuseNext(operation: "approve" | "reject"): void {
+    this.refuseNextCall.add(operation);
   }
 
   public accountOf(accountId: string): Account | undefined {
@@ -133,6 +144,10 @@ export class ReviewApiTestStub {
       send(response, 200, { account: stored.lastDecision.account });
       return;
     }
+    if (this.refuseNextCall.delete(operation)) {
+      send(response, 409, { error: { code: "failed_precondition", message: "the account is locked" } });
+      return;
+    }
     if (operation === "approve" && input.suppressApprovedMail === true && this.refusesSuppressedMail) {
       send(response, 409, { error: { code: "failed_precondition", message: "suppressApprovedMail is not supported yet" } });
       return;
@@ -148,6 +163,7 @@ export class ReviewApiTestStub {
     stored.account = { ...stored.account, status: operation === "approve" ? "active" : "rejected", revision: Number(stored.account.revision) + 1 };
     stored.lastDecision = { fingerprint, account: stored.account };
     if (this.failAfterApplying.delete(operation)) {
+      this.failingGets = this.getsFailingAfterLostAnswer;
       send(response, 503, { error: { code: "unavailable", message: "lost answer" } });
       return;
     }

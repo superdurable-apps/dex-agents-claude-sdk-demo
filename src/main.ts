@@ -1,4 +1,4 @@
-// The Worker process: the review agent's session Flow, the review ledger Flow, a Dex Client, and the SignupWatcher.
+// The Worker process: the review agent's session Flow, the review thread poller Flow, a Dex Client, and the SignupWatcher.
 
 import { newProjectConnection as newGmailConnection } from "@superdurable/connector-google-gmail";
 import { newProjectConnection as newSlackConnection } from "@superdurable/connector-slack";
@@ -13,7 +13,7 @@ import { ReviewApiClient } from "./review-api.js";
 import { ReviewSessions } from "./review-state.js";
 import type { SignupServices } from "./signup-agent.js";
 import { runSignupWatcher } from "./signup-watcher.js";
-import { SignupReviewLedgerFlow } from "./review-ledger-flow.js";
+import { SignupReviewThreadPoller } from "./review-thread-poller.js";
 
 const config = loadSignupAgentConfig();
 // DEX_CONNECTOR_CONFIG_FILE names the connector configuration with the Slack and Gmail credentials.
@@ -28,7 +28,7 @@ const services: SignupServices = {
   harnessLabel: config.harness === "claude-agent-sdk" ? claudeHarnessLabel : piHarnessLabel,
 };
 
-// SIGNUP_AGENT_HARNESS picks the harness; the prompt, the tools and the ledger are the same for both.
+// SIGNUP_AGENT_HARNESS picks the harness; the prompt, the tools and the poller are the same for both.
 const sessionFlow =
   config.harness === "claude-agent-sdk"
     ? createClaudeSignupAgent(services, {
@@ -38,17 +38,17 @@ const sessionFlow =
       })
     : createPiSignupAgent(services, piModel(config.piModel));
 let client: Client | undefined;
-const ledgerFlow = new SignupReviewLedgerFlow({
+const pollerFlow = new SignupReviewThreadPoller({
   ...services,
   reviewerSlackIds: config.reviewerSlackIds,
   client: () => client!,
   pollIntervalMs: config.threadPollIntervalMs,
 });
-const registry = new Registry([sessionFlow, ledgerFlow]);
+const registry = new Registry([sessionFlow, pollerFlow]);
 const blobCache = openBlobCache({ directory: config.dex.blobCacheDirectory, maxBytes: 256 * 1024 * 1024 });
 // The Client exists before the Worker takes Steps, which use it.
 client = new Client(registry, blobCache, config.dex.options);
-services.sessions.connect(client, sessionFlow, ledgerFlow);
+services.sessions.connect(client, sessionFlow, pollerFlow);
 const worker = new Worker(registry, blobCache, { ...config.dex.options, pull: { maxConcurrentTasks: config.workerSlots } });
 await worker.start();
 await worker.waitPullRegistered({ timeoutMs: 30_000 });
@@ -56,7 +56,7 @@ console.log(`Signup review agent (${sessionFlow.getFlowType()}) is running on ${
 
 const stopping = new AbortController();
 const watching = runSignupWatcher(
-  { client, sessionFlow, ledgerFlow, reviewApi: services.reviewApi, reviewSince: config.reviewSince },
+  { client, sessionFlow, sessions: services.sessions, reviewApi: services.reviewApi, reviewSince: config.reviewSince },
   config.watchIntervalMs,
   stopping.signal,
 );
