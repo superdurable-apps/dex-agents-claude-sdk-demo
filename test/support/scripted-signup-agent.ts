@@ -24,6 +24,12 @@ export const multiCallApplicantWord = "multi";
 export const firstTurnFailingWord = "firstfail";
 /** Applicants whose email contains this word make the turn of the reviewer's "Shorter" fail once. */
 export const laterTurnFailingWord = "laterfail";
+/** Applicants whose email contains this word make the model call right after approve_account fail, until a retry. */
+export const failAfterApproveWord = "failafterapprove";
+/** Applicants whose email contains this word make the model call right after send_welcome_email fail, until a retry. */
+export const failAfterSendWord = "failaftersend";
+/** Applicants whose email contains this word make the model only send on `send`, and keep the review open. */
+export const stayAfterSendWord = "stayaftersend";
 
 /** Runs each response of `plan` in turn, skipping the calls already made since the user message, then answers. */
 function follow(plan: readonly ScriptedStep[], seen: readonly SeenResult[]): ScriptedStep {
@@ -80,12 +86,21 @@ export function decideNextStep(rawUserTexts: readonly string[], seen: readonly S
   }
   const reply = slack?.trim().toLowerCase();
   if (reply === "approve") {
+    if (email.includes(failAfterApproveWord) && !isRetryTurn && seen.length >= 1) {
+      return { kind: "fail" };
+    }
     // The tool posts its own confirmation; the model says nothing more.
     return follow([tool("approve_account")], seen);
   }
   if (reply?.startsWith("reject ")) {
     const isRejected = seen[0]?.output.includes('"rejected"') === true;
     return follow([tool("reject_account", { reason: slack!.trim().slice("reject ".length) }), ...(isRejected ? [tool("reply_in_thread", { text: "Review done: rejected." }), tool("finish_review")] : [])], seen);
+  }
+  if (reply === "send" && (email.includes(failAfterSendWord) || email.includes(stayAfterSendWord))) {
+    if (email.includes(failAfterSendWord) && !isRetryTurn && seen.length >= 1) {
+      return { kind: "fail" };
+    }
+    return follow([tool("send_welcome_email")], seen);
   }
   if (reply === "send") {
     const isSent = seen[0]?.output.includes("messageId") === true;

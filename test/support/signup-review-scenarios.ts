@@ -9,7 +9,7 @@ import test from "node:test";
 import { GmailMock, sendMessageBranch } from "@superdurable/connector-google-gmail/mock";
 import type { Message as SlackMessage } from "@superdurable/connector-slack";
 import { GeneratedMock, listThreadMessagesRead, postThreadReplySent, postThreadReplyUncertain, postChannelMessageSent } from "@superdurable/connector-slack/mock";
-import { Client, Registry, Worker, openBlobCache, type BlobCache } from "@superdurable/dex";
+import { Client, Registry, TimeTravelType, Worker, openBlobCache, type BlobCache } from "@superdurable/dex";
 import { readAgentSnapshot, sendAgentUserMessage } from "@superdurable/dex-agents";
 import { PrivateDexEngine, pollUntil } from "@superdurable/dex-agents/testing";
 
@@ -19,7 +19,7 @@ import { SignupReviewThreadPoller, latestDraft, threadCursor, threadPage } from 
 import { type SignupServices } from "../../src/signup-agent.js";
 import { startPendingReviews } from "../../src/signup-watcher.js";
 import { ReviewApiTestStub } from "./review-api-test-stub.js";
-import { FixtureProfileSources, firstTurnFailingWord, laterTurnFailingWord, multiCallApplicantWord, passiveApplicantWord, rejectedApplicantWord } from "./scripted-signup-agent.js";
+import { FixtureProfileSources, failAfterApproveWord, failAfterSendWord, firstTurnFailingWord, laterTurnFailingWord, stayAfterSendWord, multiCallApplicantWord, passiveApplicantWord, rejectedApplicantWord } from "./scripted-signup-agent.js";
 
 const reviewerId = "UREVIEWER1";
 const bystanderId = "UBYSTANDER";
@@ -72,10 +72,11 @@ class ScriptedThread {
   }
 
   /** Adds a message from `userId`; thread reads return it from now on. */
-  public reply(userId: string, text: string): string {
+  public reply(userId: string, text: string, botId?: string): string {
     this.seconds += 1;
     const ts = `${this.seconds}.000200`;
-    this.messages.push({ channelId, timestamp: ts, threadTimestamp: this.rootTs, userId, text });
+    // A bot ID is what Slack sets on any app's message; the Slack connector 0.5 does not pass it on for threads yet.
+    this.messages.push({ channelId, timestamp: ts, threadTimestamp: this.rootTs, userId, text, ...(botId === undefined ? {} : { botId }) } as SlackMessage);
     this.publish();
     return ts;
   }
@@ -403,6 +404,59 @@ export function registerSignupReviewScenarios(setup: SignupReviewScenarioSetup):
     assert.equal(texts.filter((text) => text.startsWith("[retry turn-")).length, 1);
     assert.equal(texts.filter((text) => text.startsWith(`[slack ${ts}]`)).length, 1);
     assert.equal(threadReplies(sessionId).filter((text) => text.startsWith("*[draft ")).length, 1);
+  });
+
+  test(`${setup.harnessName}: another app's bot message gets no hint and no relay, and the cursor moves past it`, async () => {
+    const { accountId, sessionId, thread } = await startReview(passiveApplicantWord, 1710000255);
+    thread.reply("UOTHERBOT01", "approve", "B0OTHERBOT1");
+    const ts = await replyAndWait(sessionId, thread, "a note after the bot");
+    assert.deepEqual(thread.pollerNotes(), []);
+    assert.equal((await userTexts(sessionId)).filter((text) => text.includes("UOTHERBOT01")).length, 0);
+    assert.equal((await client.getAttributes(reviewPollerId(accountId), threadCursor))[0], ts);
+  });
+
+  test(`${setup.harnessName}: an approval retried after the turn failed is not made or confirmed twice`, async () => {
+    const { accountId, sessionId, thread } = await startReview(failAfterApproveWord, 1710000256);
+    // Account reads stay pending, so no [dex-cloud active] starts a turn of its own before the retry.
+    reviewApi.stalePendingReads.add(accountId);
+    try {
+      const turns = await turnsOf(sessionId);
+      thread.reply(reviewerId, "approve");
+      await pollUntil(async () => ((await userTexts(sessionId)).some((text) => text.startsWith("[retry turn-")) ? true : undefined), { description: "the retry", ...waitOptions });
+      await waitForIdle(sessionId, turns + 1);
+    } finally {
+      reviewApi.stalePendingReads.delete(accountId);
+    }
+    assert.equal(decisionsOf(accountId).length, 1);
+    assert.equal(threadReplies(sessionId).filter((text) => text.startsWith("Approved ")).length, 1);
+    assert.match((await resultsOf(sessionId, "approve_account")).at(-1) ?? "", /already done earlier in this review/);
+  });
+
+  test(`${setup.harnessName}: a send retried after the turn failed sends one email`, async () => {
+    const { sessionId, thread } = await startReview(failAfterSendWord, 1710000257);
+    await replyAndWait(sessionId, thread, "approve");
+    // The poller reports the approval; the agent takes it for its own.
+    await pollUntil(async () => ((await userTexts(sessionId)).some((text) => text.startsWith("[dex-cloud active]")) ? true : undefined), { description: "the approval reported", ...waitOptions });
+    await waitForIdle(sessionId);
+    gmail.sendMessage().forFlow(sessionId).default(sent("gmail-once"));
+    const turns = await turnsOf(sessionId);
+    thread.reply(reviewerId, "send");
+    await pollUntil(async () => ((await userTexts(sessionId)).some((text) => text.startsWith("[retry turn-")) ? true : undefined), { description: "the send's retry", ...waitOptions });
+    await waitForIdle(sessionId, turns + 1);
+    assert.equal(sendsOf(sessionId).length, 1);
+    assert.match((await resultsOf(sessionId, "send_welcome_email")).at(-1) ?? "", /refused: the welcome email for draft 1 was already sent in this review/);
+    assert.equal(threadReplies(sessionId).filter((text) => text.startsWith("Sent the welcome email")).length, 1);
+  });
+
+  test(`${setup.harnessName}: time travel of the session to before the send sends it again`, async () => {
+    const { sessionId, thread } = await startReview(stayAfterSendWord, 1710000258);
+    await replyAndWait(sessionId, thread, "approve");
+    gmail.sendMessage().forFlow(sessionId).default(sent("gmail-again"));
+    await replyAndWait(sessionId, thread, "send");
+    assert.equal(sendsOf(sessionId).length, 1);
+    // The latest single-attempt tool Step is the send; re-running it finds the session's records rewound.
+    await client.timeTravel(sessionId, { type: TimeTravelType.STEP_TYPE, stepType: "CallSingleAttemptTool", reason: "test: send again" });
+    await pollUntil(() => (sendsOf(sessionId).length === 2 ? true : undefined), { description: "the send after time travel", ...waitOptions });
   });
 
   test(`${setup.harnessName}: someone who is not a listed reviewer gets one hint and is not relayed`, async () => {

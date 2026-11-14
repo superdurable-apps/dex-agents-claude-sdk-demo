@@ -40,6 +40,8 @@ export class ReviewApiTestStub {
   public failingGets = 0;
   /** Milliseconds every get waits before it answers. */
   public getDelayMs = 0;
+  /** Accounts whose gets answer `pending_approval` while they are active, so the poller reports no decision. */
+  public readonly stalePendingReads = new Set<string>();
 
   private constructor(private readonly server: Server) {}
 
@@ -124,7 +126,9 @@ export class ReviewApiTestStub {
         send(response, 503, { error: { code: "unavailable", message: "busy" } });
         return;
       }
-      send(response, 200, { account: stored.account });
+      // A stale read, as a lagging replica would answer: the account still looks pending.
+      const stale = this.stalePendingReads.has(stored.account.accountId) && stored.account.status === "active";
+      send(response, 200, { account: stale ? { ...stored.account, status: "pending_approval" } : stored.account });
       return;
     }
     if (operation !== "approve" && operation !== "reject") {

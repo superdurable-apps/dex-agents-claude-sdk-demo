@@ -36,10 +36,12 @@ async function startReview(parts: SignupWatcherParts, account: Account): Promise
   if (failed === undefined || (await isRunning(parts.client, reviewPollerId(accountId)))) {
     return;
   }
-  if (Date.now() >= failed.dueAt) {
+  // Checked again right before the send: a poller that started meanwhile owns the retry.
+  if (Date.now() >= failed.dueAt && !(await isRunning(parts.client, reviewPollerId(accountId)))) {
     // No thread to post in yet, and connector calls run only in a Dex Step: the log is the only notice.
-    console.warn(`signup watcher: ${accountId}: the agent's ${failed.turnId} failed (${failed.error}); retry ${failed.retries + 1}`);
-    await parts.sessions.sendOnce(accountId, failed.marker, failed.text);
+    if (await parts.sessions.retryFailedTurn(accountId, failed.turnId, parts.firstRetryDelayMs)) {
+      console.warn(`signup watcher: ${accountId}: the agent's ${failed.turnId} failed (${failed.error}); retry ${failed.retries + 1} sent`);
+    }
   }
 }
 

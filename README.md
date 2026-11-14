@@ -42,9 +42,9 @@ From [`src/signup-agent.ts`](src/signup-agent.ts):
 | `post_review(recommendation, reasons, emailSubject, emailBody)` | Slack `postChannelMessage`: the review post, draft 1 in a code block, the harness, the instructions. Then it starts the review's poller with the thread and draft 1 | single attempt | Refused once the poller holds a thread. Refused when `SIGNUP_REVIEWER_SLACK_IDS` lists the Slack app's own user |
 | `post_draft(subject, body)` | Slack `postThreadReply` with `[draft <n>]`, then records it as the latest draft. The footer follows the account's status at post time: `Reply send to send this draft` once it is active, otherwise `Approve the account first` | single attempt | Needs the review thread. Refused when subject and body are the same as the latest recorded draft |
 | `reply_in_thread(text)` | Slack `postThreadReply` | single attempt | Needs the review thread |
-| `approve_account()` | ReviewAPI `approve` with the expected revision and a stable request ID, then a thread reply: `Approved <name> (<email>) on Dex Cloud. Reply send to email the welcome message.` or `Approval failed: <error>.` It asks to leave Dex Cloud's own approval mail out (`suppressApprovedMail`); a server that does not support that yet refuses, and the reply says so. When the request went out and the ReviewAPI stays busy or unreachable, it posts `Approval outcome unknown: <error>. Check the account in Dex Cloud admin; the review continues.`, and Dex records the call `outcome_unknown` | single attempt (the Slack reply's) | An account already active counts as approved; one decided the other way, or refused, is a failure. A busy ReviewAPI is tried again, up to 3 times |
+| `approve_account()` | ReviewAPI `approve` with the expected revision and a stable request ID, then a thread reply: `Approved <name> (<email>) on Dex Cloud. Reply send to email the welcome message.` or `Approval failed: <error>.` It asks to leave Dex Cloud's own approval mail out (`suppressApprovedMail`); a server that does not support that yet refuses, and the reply says so. When the request went out and the ReviewAPI stays busy or unreachable, it posts `Approval outcome unknown: <error>. Check the account in Dex Cloud admin; the review continues.`, and Dex records the call `outcome_unknown` | single attempt (the Slack reply's) | An account already active counts as approved; one decided the other way, or refused, is a failure. A busy ReviewAPI is tried again, up to 3 times. When the session's own records already hold a succeeded call of the same decision (as after a retried turn), it returns that outcome without a request or a second confirmation |
 | `reject_account(reason)` | ReviewAPI `reject` the same way, then `Rejected <name>: <reason>.` or `Rejection failed: <error>.` | single attempt (the Slack reply's) | The same |
-| `send_welcome_email()` | Gmail `sendMessage` of the **latest posted draft** to the applicant, then a thread reply: `Sent the welcome email to <email>.`; when Gmail conclusively rejects the message (`providerRejected`), `Sending the welcome email failed: <reason>. Nothing was sent.`, recorded as a failed call; for any outcome Gmail leaves unknown, `Sending the welcome email failed: <error>. Check Sent Mail; if nothing went out, send it manually.` | single attempt | The account is active, and a draft is posted |
+| `send_welcome_email()` | Gmail `sendMessage` of the **latest posted draft** to the applicant, then a thread reply: `Sent the welcome email to <email>.`; when Gmail conclusively rejects the message (`providerRejected`), `Sending the welcome email failed: <reason>. Nothing was sent.`, recorded as a failed call; for any outcome Gmail leaves unknown, `Sending the welcome email failed: <error>. Check Sent Mail; if nothing went out, send it manually.` | single attempt | The account is active, and a draft is posted. Refused with `the welcome email for draft <n> was already sent in this review` when the session's own records hold a send after that draft was posted that did not definitely fail |
 | `finish_review()` | Ends the review: cancels its own session (a session never ends on its own), and the poller then completes | idempotent | The account is no longer pending |
 
 No tool asks for Dex tool approval and no tool checks the reviewers' replies: the poller relays every
@@ -167,7 +167,9 @@ before switching, or switch back to let them finish.
     minutes, each next one twice as long, up to 30 minutes, with no limit on attempts. The back-off is
     worked out from the session itself: the retries are the retry messages since the message whose turn
     first failed, and the wait counts from the newest stored message. The marker names the failed turn,
-    so each retry is sent once.
+    so each retry is sent once. Right before it sends, the poller (or the watcher) reads the session
+    again and sends only if the same turn is still the failed one and its retry is due; the watcher also
+    checks again that no poller runs.
   - Each thread note (the hint or the failed turn) is its own `PostThreadNote` Step, so each post gets
     its own connector call identity and dispatch fence; the note is best effort and is not repeated
     when Slack refuses it.
@@ -235,7 +237,10 @@ its failure; an approval whose answer was lost, tried again and counted as appro
 whose answer was lost while the ReviewAPI stays busy, posted as an unknown outcome; the same
 `[slack <ts>]` message arriving twice and handled once; a first turn that fails twice, retried by the
 watcher with a back-off until the review posts and completes; a later turn that fails, reported once in
-the thread and retried; a non-reviewer's replies, answered with one hint and never relayed; an approval followed by `hold`, reported once as
+the thread and retried; a non-reviewer's replies, answered with one hint and never relayed; another
+app's bot message, neither hinted nor relayed; an approval and a send each followed by a failed model call
+and the automatic retry, which neither repeat the decision or its confirmation nor send a second email;
+time travel of the session to before the send, which sends it again; an approval followed by `hold`, reported once as
 `[dex-cloud active]`, which the agent ignores before it sends the email; a confirmation post that fails
 without changing the approval; a rejection with its reason in the thread; a send whose outcome is unknown, with the
 Sent Mail note; a send Gmail rejects, recorded as failed with "Nothing was sent"; a draft the same as the
@@ -281,6 +286,14 @@ injected lookup, for redirects to private addresses, and for linear-time parsing
   Each connector call still happens at most once.
 - finish_review cancels its own session from inside its tool Step, so that call's result is never
   saved. The summary was posted before it, and the session is closed.
+- A retried turn may ask the agent to repeat a write that already happened. send_welcome_email and the
+  decision tools check the session's own tool records (stored tool results, the session's turn notes,
+  which list a failed turn's calls, and the running turn's finished calls), read through the session's
+  messages up to 50 pages of 200. Those records live in the session Flow, so time travel of the session
+  to before the send rewinds them and the email can be sent again on purpose. A send whose outcome is
+  unknown counts as sent; a record beyond the 50 pages is not seen.
+- The re-check before a retry is not atomic: a message that arrives between it and the send can still
+  meet a retry message, which the agent then handles as well.
 - A failed turn is retried until a turn succeeds, every 30 minutes at most, with no limit on attempts:
   a lasting failure, such as a used-up Claude plan, keeps retrying, and each retry is one more turn in
   the session. Only the first failure in a row is posted in the thread. Before the review post there is
@@ -289,8 +302,13 @@ injected lookup, for redirects to private addresses, and for linear-time parsing
   come sooner than its back-off. The watcher sees only pending sign-ups, so a review without a poller
   whose account was decided elsewhere is not retried.
 - The hint to a non-reviewer is remembered in the poller's Step input and on the page being read. A
-  hint that a restarted poller cannot see on the page it reads can be posted again. Thread messages
-  carry no bot marker, so another app's bot user that replies in the thread gets the hint too.
+  hint that a restarted poller cannot see on the page it reads can be posted again. The Step input keeps
+  the last 200 users told.
+- Thread messages with a bot ID (any app's) are neither hinted nor relayed, but the Slack connector 0.5
+  drops `bot_id` from thread messages (it keeps it only for channel messages), so until it passes it on,
+  another app's bot user that replies in the thread is treated as a person and gets the hint.
+- A human reply after a failed turn whose own turn fails again starts a new run of failures, with its own
+  notice in the thread.
 - Every review finishes within 7 days, or its poller stops it.
 - Each open review's poller holds one Worker slot while it polls (one long-running Step). The Worker
   has `SIGNUP_WORKER_SLOTS` slots (64), so with that many open reviews no slot is left for the
