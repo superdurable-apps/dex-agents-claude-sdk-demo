@@ -249,10 +249,38 @@ export interface ToolRecord {
 }
 
 const bareToolName = (name: string | null | undefined) => (name ?? "").split("__").at(-1)!.split(".").at(-1)!;
-/** A tool result that proves nothing happened: the tools' refusals and definite failures. */
-const isDefiniteFailure = (output: string) => /^The tool call failed: |refused: |nothing was sent|^not sent: |^invalid arguments|returned providerRejected|failed: /.test(output);
-const isUnknownOutcome = (output: string) => output === outcomeUnknownToolResult || /outcome (is )?unknown/i.test(output);
-const outcomeOfResult = (output: string): ToolRecord["outcome"] => (isUnknownOutcome(output) ? "unknown" : isDefiniteFailure(output) ? "failed" : "succeeded");
+/**
+ * The starts of a stored tool result that prove nothing happened: the framework's text for a failed call, and the
+ * tools' own refusals and definite failures. Only the start counts; the same words later are the result's own text.
+ */
+const definiteFailureStarts = ["The tool call failed: ", "refused: ", "not sent: ", "invalid arguments", "send_welcome_email failed and nothing was sent: "];
+const isJsonObject = (output: string): boolean => {
+  try {
+    const value: unknown = JSON.parse(output);
+    return typeof value === "object" && value !== null && !Array.isArray(value);
+  } catch {
+    return false;
+  }
+};
+
+/**
+ * The outcome of a stored tool result, from its structure first: every tool's success is a JSON object, and no
+ * failure text is. Then only exact starts decide: the framework's unknown-outcome text, or a definite failure. Any
+ * other text is a failure for most tools, so it never counts as a draft's post or a decision, and a possible send for
+ * send_welcome_email.
+ */
+export function outcomeOfResult(tool: string, output: string): ToolRecord["outcome"] {
+  if (isJsonObject(output)) {
+    return "succeeded";
+  }
+  if (output.startsWith(outcomeUnknownToolResult)) {
+    return "unknown";
+  }
+  if (definiteFailureStarts.some((start) => output.startsWith(start))) {
+    return "failed";
+  }
+  return tool === "send_welcome_email" ? "unknown" : "failed";
+}
 const outcomeOfStatus = (status: string): ToolRecord["outcome"] => (status === "succeeded" ? "succeeded" : status === "outcome_unknown" ? "unknown" : "failed");
 /** The turn notes the session writes itself, one entry per tool call: `- <tool> <arguments> -> <status>: <outcome>`. */
 const noteOrigins = new Set(["turn_failure_note", "turn_steered_note", "turn_cancelled_note"]);
@@ -376,7 +404,8 @@ export function toolRecordsOf(messages: readonly AgentMessage[], activeToolCalls
   for (const message of messages) {
     if (message.role === "tool" && message.toolName) {
       const output = message.toolOutput ?? message.text ?? "";
-      records.push({ tool: bareToolName(message.toolName), outcome: outcomeOfResult(output), output, position: message.sequence, source: "result" });
+      const tool = bareToolName(message.toolName);
+      records.push({ tool, outcome: outcomeOfResult(tool, output), output, position: message.sequence, source: "result" });
     } else if (message.role === "user" && message.origin !== undefined && noteOrigins.has(message.origin)) {
       const text = message.text ?? "";
       // From a note: evidence of a send, and a decision's success, which a decision tool checks against the account
