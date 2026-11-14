@@ -118,8 +118,12 @@ export class ReviewSessions {
     return readAgentSnapshot(this.dex.client, this.dex.sessionFlow, reviewSessionId(accountId));
   }
 
-  /** The session's snapshot and its stored messages, oldest first: the snapshot's window and up to 50 pages of 200 before it. */
-  public async history(accountId: string): Promise<{ snapshot: AgentSnapshot; messages: AgentMessage[] }> {
+  /**
+   * The session's snapshot and its stored messages, oldest first: the snapshot's window and up to 50 pages of 200
+   * before it. `isComplete` says whether they reach back to the first message; past the page cap, or when older
+   * messages are gone, they do not.
+   */
+  public async history(accountId: string): Promise<{ snapshot: AgentSnapshot; messages: AgentMessage[]; isComplete: boolean }> {
     const { client, sessionFlow } = this.dex;
     const sessionId = reviewSessionId(accountId);
     const snapshot = await readAgentSnapshot(client, sessionFlow, sessionId);
@@ -131,16 +135,16 @@ export class ReviewSessions {
       }
       messages = [...older.messages, ...messages];
     }
-    return { snapshot, messages };
+    return { snapshot, messages, isComplete: (messages[0]?.sequence ?? 1) <= 1 };
   }
 
   /**
    * The session's own record of its tool calls: the stored tool results and turn notes, and the finished calls of
    * the running turn. It lives in the session Flow, so time travel of the session rewinds it.
    */
-  public async toolRecords(accountId: string): Promise<ToolRecord[]> {
-    const { snapshot, messages } = await this.history(accountId);
-    return toolRecordsOf(messages, snapshot.toolCalls);
+  public async toolRecords(accountId: string): Promise<ToolHistory> {
+    const { snapshot, messages, isComplete } = await this.history(accountId);
+    return { records: toolRecordsOf(messages, snapshot.toolCalls), isComplete };
   }
 
   /**
@@ -237,6 +241,11 @@ export interface ToolRecord {
   readonly output: string;
   /** Where the session stored it: a message sequence, or after every stored message for the running turn. */
   readonly position: number;
+  /**
+   * Where it comes from: a stored tool result, the running turn's call records, or a turn note. A note's outcome
+   * texts are free text that can look like more entries, so a note only ever adds evidence of a send.
+   */
+  readonly source: "result" | "active" | "note";
 }
 
 const bareToolName = (name: string | null | undefined) => (name ?? "").split("__").at(-1)!.split(".").at(-1)!;
@@ -245,9 +254,117 @@ const isDefiniteFailure = (output: string) => /^The tool call failed: |refused: 
 const isUnknownOutcome = (output: string) => output === outcomeUnknownToolResult || /outcome (is )?unknown/i.test(output);
 const outcomeOfResult = (output: string): ToolRecord["outcome"] => (isUnknownOutcome(output) ? "unknown" : isDefiniteFailure(output) ? "failed" : "succeeded");
 const outcomeOfStatus = (status: string): ToolRecord["outcome"] => (status === "succeeded" ? "succeeded" : status === "outcome_unknown" ? "unknown" : "failed");
-/** The turn notes the session writes itself, one line per tool call: `- <tool> <arguments> -> <status>: <outcome>`. */
+/** The turn notes the session writes itself, one entry per tool call: `- <tool> <arguments> -> <status>: <outcome>`. */
 const noteOrigins = new Set(["turn_failure_note", "turn_steered_note", "turn_cancelled_note"]);
-const noteLine = /^- (\S+) .*? -> (succeeded|failed|rejected|outcome_unknown): (.*)$/;
+const noteStatuses = ["succeeded", "failed", "rejected", "outcome_unknown"] as const;
+
+/** The end (exclusive) of the JSON value that starts at `start`, or -1 when none starts there. Strings and nesting count. */
+export function jsonValueEnd(text: string, start: number): number {
+  const first = text[start];
+  let end = -1;
+  if (first === "{" || first === "[") {
+    let depth = 0;
+    for (let index = start; index < text.length && end < 0; index++) {
+      const char = text[index];
+      if (char === '"') {
+        index = stringEnd(text, index) - 1;
+        if (index < 0) {
+          return -1;
+        }
+      } else if (char === "{" || char === "[") {
+        depth++;
+      } else if (char === "}" || char === "]") {
+        depth--;
+        end = depth === 0 ? index + 1 : -1;
+      }
+    }
+  } else if (first === '"') {
+    end = stringEnd(text, start);
+  } else {
+    end = start + (/^(?:-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|true|false|null)/.exec(text.slice(start))?.[0].length ?? 0);
+  }
+  if (end <= start) {
+    return -1;
+  }
+  try {
+    JSON.parse(text.slice(start, end));
+    return end;
+  } catch {
+    return -1;
+  }
+}
+
+/** The end (exclusive) of the JSON string that starts at `start`, or -1. */
+function stringEnd(text: string, start: number): number {
+  for (let index = start + 1; index < text.length; index++) {
+    if (text[index] === "\\") {
+      index++;
+    } else if (text[index] === '"') {
+      return index + 1;
+    }
+  }
+  return -1;
+}
+
+/**
+ * The tool calls of a turn note, read entry by entry from where each entry starts: the tool name, the arguments as
+ * one complete JSON value, then exactly ` -> <status>: `. The arguments come first and are scanned whole, so text in
+ * them, such as ` -> succeeded: `, never decides a status. An entry that does not read this way gets no status.
+ */
+export function noteEntries(text: string): NoteEntry[] {
+  const found: { start: number; tool: string; status: NoteEntry["status"]; outputStart: number }[] = [];
+  // Valid JSON arguments hold no raw newline, so an entry start is never inside them; inside an outcome it can be,
+  // which at worst adds an entry, never hides one.
+  for (let start = text.indexOf("\n- "); start >= 0; start = text.indexOf("\n- ", start + 1)) {
+    const nameEnd = text.indexOf(" ", start + 3);
+    const tool = nameEnd < 0 ? "" : text.slice(start + 3, nameEnd);
+    if (tool === "" || /\s/.test(tool)) {
+      continue;
+    }
+    const argsEnd = jsonValueEnd(text, nameEnd + 1);
+    const status = argsEnd < 0 ? undefined : noteStatuses.find((candidate) => text.startsWith(` -> ${candidate}:`, argsEnd));
+    found.push({ start, tool: bareToolName(tool), status, outputStart: status === undefined ? nameEnd : argsEnd + ` -> ${status}: `.length });
+  }
+  // An entry's outcome runs to the next entry's start, the last one's to the note's last line.
+  const footer = text.lastIndexOf("\n");
+  return found.map((entry, index) => {
+    const until = found[index + 1]?.start ?? footer;
+    const end = Math.max(entry.outputStart, until);
+    return { tool: entry.tool, status: entry.status, output: text.slice(entry.outputStart, end), start: entry.start, outputStart: entry.outputStart, end };
+  });
+}
+
+export interface NoteEntry {
+  readonly tool: string;
+  /** The entry's status, or `undefined` when the entry does not read unambiguously. */
+  readonly status: (typeof noteStatuses)[number] | undefined;
+  readonly output: string;
+  /** Where its `\n- ` starts, where its outcome text starts, and where that ends, in the note. */
+  readonly start: number;
+  readonly outputStart: number;
+  readonly end: number;
+}
+
+const sendTool = "send_welcome_email";
+
+/**
+ * The evidence of a send in one turn note, as outcomes: each send entry that reads unambiguously, with its status;
+ * a send entry that does not, as unknown; and any other mention of the send tool, such as one inside another call's
+ * arguments or outcome text, as unknown too. Only a send's own header and outcome text explain a mention.
+ */
+export function noteSendEvidence(text: string): ToolRecord["outcome"][] {
+  const entries = noteEntries(text);
+  const sends = entries.filter((entry) => entry.tool === sendTool);
+  const evidence = sends.map((entry) => (entry.status === undefined ? "unknown" : outcomeOfStatus(entry.status)));
+  const isExplained = (at: number) => sends.some((entry) => (at > entry.start && at < entry.outputStart) || (entry.status !== undefined && at >= entry.outputStart && at < entry.end));
+  for (let at = text.indexOf(sendTool); at >= 0; at = text.indexOf(sendTool, at + 1)) {
+    if (!isExplained(at)) {
+      evidence.push("unknown");
+      break;
+    }
+  }
+  return evidence;
+}
 
 /**
  * The tool calls the session recorded: stored tool results, the session's own turn notes (a failed turn's calls are
@@ -259,12 +376,17 @@ export function toolRecordsOf(messages: readonly AgentMessage[], activeToolCalls
   for (const message of messages) {
     if (message.role === "tool" && message.toolName) {
       const output = message.toolOutput ?? message.text ?? "";
-      records.push({ tool: bareToolName(message.toolName), outcome: outcomeOfResult(output), output, position: message.sequence });
+      records.push({ tool: bareToolName(message.toolName), outcome: outcomeOfResult(output), output, position: message.sequence, source: "result" });
     } else if (message.role === "user" && message.origin !== undefined && noteOrigins.has(message.origin)) {
-      for (const line of (message.text ?? "").split("\n")) {
-        const match = noteLine.exec(line);
-        if (match !== null) {
-          records.push({ tool: bareToolName(match[1]), outcome: outcomeOfStatus(match[2]!), output: match[3]!, position: message.sequence });
+      const text = message.text ?? "";
+      // From a note: evidence of a send, and a decision's success, which a decision tool checks against the account
+      // before it relies on it. Never a draft post: a note's free text could fake one after a real send.
+      for (const outcome of noteSendEvidence(text)) {
+        records.push({ tool: sendTool, outcome, output: "", position: message.sequence, source: "note" });
+      }
+      for (const entry of noteEntries(text)) {
+        if ((entry.tool === "approve_account" || entry.tool === "reject_account") && entry.status !== undefined) {
+          records.push({ tool: entry.tool, outcome: outcomeOfStatus(entry.status), output: entry.output, position: message.sequence, source: "note" });
         }
       }
     }
@@ -272,23 +394,48 @@ export function toolRecordsOf(messages: readonly AgentMessage[], activeToolCalls
   const after = (messages.at(-1)?.sequence ?? 0) + 1;
   for (const call of [...activeToolCalls].sort((left, right) => left.deferralOrder - right.deferralOrder)) {
     if (isFinalToolCallStatus(call.status)) {
-      records.push({ tool: bareToolName(call.toolName), outcome: outcomeOfStatus(call.status), output: call.output ?? call.error ?? "", position: after + call.deferralOrder / 1e6 });
+      records.push({ tool: bareToolName(call.toolName), outcome: outcomeOfStatus(call.status), output: call.output ?? call.error ?? "", position: after + call.deferralOrder / 1e6, source: "active" });
     }
   }
   return records;
 }
 
+/** The session's tool records, and whether they come from its whole history. */
+export interface ToolHistory {
+  readonly records: readonly ToolRecord[];
+  readonly isComplete: boolean;
+}
+
 /**
  * Whether the session already sent, or may have sent, the welcome email for draft `draftNumber`: a send that did not
- * definitely fail, recorded after the call that posted that draft. Without that call in the records, any such send
- * counts.
+ * definitely fail, recorded after the call that posted that draft. Without that call in a complete history, any such
+ * send counts; without it in an incomplete history, the draft counts as sent, since the part not read may hold it.
  */
-export function wasDraftSent(records: readonly ToolRecord[], draftNumber: number): boolean {
+export function wasDraftSent(history: ToolHistory, draftNumber: number): boolean {
+  const { records, isComplete } = history;
+  // A draft's post counts only from a structured record: a stored tool result or the running turn's call record.
   const posted = records.filter(
-    (record) => (record.tool === "post_review" || record.tool === "post_draft") && record.outcome === "succeeded" && record.output.includes(`"draft":{"number":${draftNumber}}`),
+    (record) =>
+      record.source !== "note" &&
+      (record.tool === "post_review" || record.tool === "post_draft") &&
+      record.outcome === "succeeded" &&
+      record.output.includes(`"draft":{"number":${draftNumber}}`),
   );
+  if (posted.length === 0 && !isComplete) {
+    return true;
+  }
   const since = posted.at(-1)?.position ?? Number.NEGATIVE_INFINITY;
   return records.some((record) => record.tool === "send_welcome_email" && record.outcome !== "failed" && record.position > since);
+}
+
+/**
+ * What a decision tool does with an earlier success of the same decision in this session: return it when the account
+ * still shows it; say what changed when the account was decided the other way since; decide again when the account
+ * is pending, since then the record does not match the account (a stale read, or text that only looks like a record).
+ */
+export function earlierDecision(decision: "approve" | "reject", accountStatus: string): "same" | "changed" | "decide" {
+  const target = decision === "approve" ? "active" : "rejected";
+  return accountStatus === target ? "same" : accountStatus === "pending_approval" ? "decide" : "changed";
 }
 
 /** The output of the session's latest succeeded call of `tool`, or `undefined`. */

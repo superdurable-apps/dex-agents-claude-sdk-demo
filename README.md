@@ -42,7 +42,7 @@ From [`src/signup-agent.ts`](src/signup-agent.ts):
 | `post_review(recommendation, reasons, emailSubject, emailBody)` | Slack `postChannelMessage`: the review post, draft 1 in a code block, the harness, the instructions. Then it starts the review's poller with the thread and draft 1 | single attempt | Refused once the poller holds a thread. Refused when `SIGNUP_REVIEWER_SLACK_IDS` lists the Slack app's own user |
 | `post_draft(subject, body)` | Slack `postThreadReply` with `[draft <n>]`, then records it as the latest draft. The footer follows the account's status at post time: `Reply send to send this draft` once it is active, otherwise `Approve the account first` | single attempt | Needs the review thread. Refused when subject and body are the same as the latest recorded draft |
 | `reply_in_thread(text)` | Slack `postThreadReply` | single attempt | Needs the review thread |
-| `approve_account()` | ReviewAPI `approve` with the expected revision and a stable request ID, then a thread reply: `Approved <name> (<email>) on Dex Cloud. Reply send to email the welcome message.` or `Approval failed: <error>.` It asks to leave Dex Cloud's own approval mail out (`suppressApprovedMail`); a server that does not support that yet refuses, and the reply says so. When the request went out and the ReviewAPI stays busy or unreachable, it posts `Approval outcome unknown: <error>. Check the account in Dex Cloud admin; the review continues.`, and Dex records the call `outcome_unknown` | single attempt (the Slack reply's) | An account already active counts as approved; one decided the other way, or refused, is a failure. A busy ReviewAPI is tried again, up to 3 times. When the session's own records already hold a succeeded call of the same decision (as after a retried turn), it returns that outcome without a request or a second confirmation |
+| `approve_account()` | ReviewAPI `approve` with the expected revision and a stable request ID, then a thread reply: `Approved <name> (<email>) on Dex Cloud. Reply send to email the welcome message.` or `Approval failed: <error>.` It asks to leave Dex Cloud's own approval mail out (`suppressApprovedMail`); a server that does not support that yet refuses, and the reply says so. When the request went out and the ReviewAPI stays busy or unreachable, it posts `Approval outcome unknown: <error>. Check the account in Dex Cloud admin; the review continues.`, and Dex records the call `outcome_unknown` | single attempt (the Slack reply's) | An account already active counts as approved; one decided the other way, or refused, is a failure. A busy ReviewAPI is tried again, up to 3 times. When the session's own records already hold a succeeded call of the same decision (as after a retried turn), it reads the account: still decided that way, it returns the earlier outcome without a request or a second confirmation; decided the other way since, it returns `changed` with the current status and posts nothing; still pending, it decides as usual |
 | `reject_account(reason)` | ReviewAPI `reject` the same way, then `Rejected <name>: <reason>.` or `Rejection failed: <error>.` | single attempt (the Slack reply's) | The same |
 | `send_welcome_email()` | Gmail `sendMessage` of the **latest posted draft** to the applicant, then a thread reply: `Sent the welcome email to <email>.`; when Gmail conclusively rejects the message (`providerRejected`), `Sending the welcome email failed: <reason>. Nothing was sent.`, recorded as a failed call; for any outcome Gmail leaves unknown, `Sending the welcome email failed: <error>. Check Sent Mail; if nothing went out, send it manually.` | single attempt | The account is active, and a draft is posted. Refused with `the welcome email for draft <n> was already sent in this review` when the session's own records hold a send after that draft was posted that did not definitely fail |
 | `finish_review()` | Ends the review: cancels its own session (a session never ends on its own), and the poller then completes | idempotent | The account is no longer pending |
@@ -239,7 +239,8 @@ whose answer was lost while the ReviewAPI stays busy, posted as an unknown outco
 watcher with a back-off until the review posts and completes; a later turn that fails, reported once in
 the thread and retried; a non-reviewer's replies, answered with one hint and never relayed; another
 app's bot message, neither hinted nor relayed; an approval and a send each followed by a failed model call
-and the automatic retry, which neither repeat the decision or its confirmation nor send a second email;
+and the automatic retry, which neither repeat the decision or its confirmation nor send a second email; an
+approval retried after an admin rejected the account, which reports the change and posts nothing;
 time travel of the session to before the send, which sends it again; an approval followed by `hold`, reported once as
 `[dex-cloud active]`, which the agent ignores before it sends the email; a confirmation post that fails
 without changing the approval; a rejection with its reason in the thread; a send whose outcome is unknown, with the
@@ -291,7 +292,17 @@ injected lookup, for redirects to private addresses, and for linear-time parsing
   which list a failed turn's calls, and the running turn's finished calls), read through the session's
   messages up to 50 pages of 200. Those records live in the session Flow, so time travel of the session
   to before the send rewinds them and the email can be sent again on purpose. A send whose outcome is
-  unknown counts as sent; a record beyond the 50 pages is not seen.
+  unknown counts as sent. When the history read stops short of the first message (past the 50 pages, or
+  with older messages gone) and the post of the current draft is not in what was read, the draft counts as
+  sent and the send is refused. A turn note's outcome texts are free text (a ReviewAPI error or a fetched
+  page can hold a line that looks like another entry), so a note only ever adds evidence of a send: each
+  send entry that did not definitely fail, a send entry that does not read unambiguously, and any other
+  mention of `send_welcome_email` in the note count as a possible send. A note never counts as a draft's
+  post; that comes only from a stored tool result or the running turn's call record. Entries are read
+  structurally (the tool name, the arguments as one whole JSON value, then the status), so text in a
+  call's arguments never decides a status. The cost of failing closed: a note that names the send tool in
+  another call's text, or a send and a newer draft in the same failed turn, blocks the send of that draft,
+  which then goes out by hand.
 - The re-check before a retry is not atomic: a message that arrives between it and the send can still
   meet a retry message, which the agent then handles as well.
 - A failed turn is retried until a turn succeeds, every 30 minutes at most, with no limit on attempts:

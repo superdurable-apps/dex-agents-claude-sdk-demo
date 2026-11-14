@@ -13,7 +13,7 @@ import { z } from "zod";
 
 import type { ProfileSources } from "./profile-sources.js";
 import { ReviewApiError, type Account, type ReviewApiClient } from "./review-api.js";
-import { accountIdOf, refusedPrefix, reviewSessionId, succeededOutput, wasDraftSent, type ReviewSessions } from "./review-state.js";
+import { accountIdOf, earlierDecision, refusedPrefix, reviewSessionId, succeededOutput, wasDraftSent, type ReviewSessions } from "./review-state.js";
 import type { ReviewThread } from "./review-thread-poller.js";
 
 export const signupAgentPrompt = `You review sign-ups for Dex Cloud, a hosted platform for building durable applications and AI agents, together with the admins in Slack.
@@ -334,13 +334,26 @@ export function createSignupConnectorTools(services: SignupServices): ToolSource
     write(threadReply, async (call, args) => {
       const accountId = accountOf(call);
       const reason = decision === "reject" ? rejectSchema.parse(args).reason : "";
-      const { thread, earlier } = await beforeDispatch(async () => ({
-        thread: await requireThread(accountId),
-        earlier: succeededOutput(await sessions.toolRecords(accountId), `${decision}_account`),
-      }));
-      if (earlier !== undefined) {
-        // This decision already succeeded in this session, as after a retried turn: no second request or confirmation.
-        return newMutationBranch("sent", { ...parseObject(earlier), note: "already done earlier in this review; nothing was posted again" });
+      const { thread, earlier, current } = await beforeDispatch(async () => {
+        const thread = await requireThread(accountId);
+        const earlier = succeededOutput((await sessions.toolRecords(accountId)).records, `${decision}_account`);
+        // A read only: the account as it is now decides what an earlier success still means.
+        const current = earlier === undefined ? undefined : await services.reviewApi.getAccount(accountId, call.context.cancellationSignal);
+        return { thread, earlier, current };
+      });
+      if (earlier !== undefined && current !== undefined) {
+        const verdict = earlierDecision(decision, current.status);
+        if (verdict === "same") {
+          // This decision already succeeded in this session, as after a retried turn: no second request or confirmation.
+          return newMutationBranch("sent", { ...parseObject(earlier), accountStatus: current.status, note: "already done earlier in this review; nothing was posted again" });
+        }
+        if (verdict === "changed") {
+          return newMutationBranch("sent", {
+            status: "changed",
+            accountStatus: current.status,
+            note: `this review already made this decision, and the account is now ${current.status} in Dex Cloud, decided there since; nothing was requested or posted`,
+          });
+        }
       }
       const post = async (input: ThreadReplyInput) => threadReply.invoke(call, input);
       let account: Account;

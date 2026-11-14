@@ -145,6 +145,8 @@ export function registerSignupReviewScenarios(setup: SignupReviewScenarioSetup):
     // The poller lists the bot as a reviewer on purpose: its own posts must still never be relayed.
     pollerFlow = new SignupReviewThreadPoller({
       ...services,
+      // Its own key, so a test can show the poller alone a stale account.
+      reviewApi: new ReviewApiClient({ baseUrl: reviewApi.baseUrl, apiKey: reviewApi.pollerApiKey }),
       reviewerSlackIds: new Set([reviewerId, botUserId]),
       client: () => client,
       pollIntervalMs: 200,
@@ -417,19 +419,40 @@ export function registerSignupReviewScenarios(setup: SignupReviewScenarioSetup):
 
   test(`${setup.harnessName}: an approval retried after the turn failed is not made or confirmed twice`, async () => {
     const { accountId, sessionId, thread } = await startReview(failAfterApproveWord, 1710000256);
-    // Account reads stay pending, so no [dex-cloud active] starts a turn of its own before the retry.
-    reviewApi.stalePendingReads.add(accountId);
+    // The poller's account reads stay pending, so no [dex-cloud active] starts a turn of its own before the retry.
+    reviewApi.pollerSeesPending.add(accountId);
     try {
       const turns = await turnsOf(sessionId);
       thread.reply(reviewerId, "approve");
       await pollUntil(async () => ((await userTexts(sessionId)).some((text) => text.startsWith("[retry turn-")) ? true : undefined), { description: "the retry", ...waitOptions });
       await waitForIdle(sessionId, turns + 1);
     } finally {
-      reviewApi.stalePendingReads.delete(accountId);
+      reviewApi.pollerSeesPending.delete(accountId);
     }
     assert.equal(decisionsOf(accountId).length, 1);
     assert.equal(threadReplies(sessionId).filter((text) => text.startsWith("Approved ")).length, 1);
     assert.match((await resultsOf(sessionId, "approve_account")).at(-1) ?? "", /already done earlier in this review/);
+  });
+
+  test(`${setup.harnessName}: an approval retried after an admin rejected the account says so and posts nothing`, async () => {
+    const { accountId, sessionId, thread } = await startReview(failAfterApproveWord, 1710000259);
+    reviewApi.pollerSeesPending.add(accountId);
+    try {
+      const turns = await turnsOf(sessionId);
+      thread.reply(reviewerId, "approve");
+      // The approval is made; while its turn fails, an admin rejects the account in Dex Cloud admin.
+      await pollUntil(() => (decisionsOf(accountId).length === 1 ? true : undefined), { description: "the approval", ...waitOptions });
+      reviewApi.decideElsewhere(accountId, "rejected");
+      await pollUntil(async () => ((await userTexts(sessionId)).some((text) => text.startsWith("[retry turn-")) ? true : undefined), { description: "the retry", ...waitOptions });
+      await waitForIdle(sessionId, turns + 1);
+    } finally {
+      reviewApi.pollerSeesPending.delete(accountId);
+    }
+    assert.equal(decisionsOf(accountId).length, 1);
+    assert.equal(threadReplies(sessionId).filter((text) => /^(Approved |Approval )/.test(text)).length, 1);
+    const result = (await resultsOf(sessionId, "approve_account")).at(-1) ?? "";
+    assert.match(result, /"status":"changed"/);
+    assert.match(result, /now rejected in Dex Cloud/);
   });
 
   test(`${setup.harnessName}: a send retried after the turn failed sends one email`, async () => {
