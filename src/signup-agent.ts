@@ -423,7 +423,7 @@ export function createSignupConnectorTools(services: SignupServices): ToolSource
 
   const slackTool = (name: string, operationId: string, description: string, schema: z.ZodObject, operation: Mutation<Record<string, unknown>, unknown>) =>
     connectorTool(operation, slack.reference, {
-      manifest: manifestFor(slackManifest, operationId, description, schema),
+      manifest: manifestFor(slackManifest as unknown as ConnectorPackageManifest, operationId, description, schema),
       inputValidator: schema,
       name,
       requiresApproval: false,
@@ -435,7 +435,7 @@ export function createSignupConnectorTools(services: SignupServices): ToolSource
     slackTool("approve_account", "postThreadReply", "Approve the account in Dex Cloud; the tool posts the outcome in the review thread.", z.object({}), decisionTool("approve")),
     slackTool("reject_account", "postThreadReply", "Reject the account in Dex Cloud with the reviewer's reason; the tool posts the outcome in the review thread.", rejectSchema, decisionTool("reject")),
     connectorTool(sendWelcomeEmail, gmail.reference, {
-      manifest: manifestFor(gmailManifest, "sendMessage", "Send the latest posted draft to the applicant once the account is approved; the tool posts the outcome in the review thread.", z.object({})),
+      manifest: manifestFor(gmailManifest as unknown as ConnectorPackageManifest, "sendMessage", "Send the latest posted draft to the applicant once the account is approved; the tool posts the outcome in the review thread.", z.object({})),
       inputValidator: z.object({}),
       name: "send_welcome_email",
       requiresApproval: false,
